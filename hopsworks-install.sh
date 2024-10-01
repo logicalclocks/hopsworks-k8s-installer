@@ -46,75 +46,88 @@ check_requirements() {
     print_colored "System requirements check completed." "green"
 }
 
-# Get user information
-get_user_info() {
-    print_colored "\nPlease provide the following information:" "blue"
-    read -p "Your name: " name
-    read -p "Your email address: " email
-    read -p "Your company name: " company
-    
-    print_colored "\nPlease choose a license agreement:" "blue"
-    echo "1. Startup Software License"
-    echo "2. Evaluation Agreement"
-    
-    while true; do
-        read -p "Enter 1 or 2: " choice
-        if [[ $choice == "1" || $choice == "2" ]]; then
-            break
-        fi
-        print_colored "Invalid choice. Please enter 1 or 2." "yellow"
+#!/bin/bash
+
+# (Previous code for ASCII art and configuration variables remains the same)
+
+# Parse command-line arguments
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --name) name="$2"; shift ;;
+            --email) email="$2"; shift ;;
+            --company) company="$2"; shift ;;
+            --license) license="$2"; shift ;;
+            --agree) agree=true ;;
+            --skip-requirements) skip_requirements=true ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+        shift
     done
-    
-    if [[ $choice == "1" ]]; then
-        license_url=$STARTUP_LICENSE_URL
-        license_type="Startup"
-    else
-        license_url=$EVALUATION_LICENSE_URL
-        license_type="Evaluation"
+}
+
+# Get user information (interactive or from arguments)
+get_user_info() {
+    if [[ -z $name ]]; then
+        read -p "Your name: " name
+    fi
+    if [[ -z $email ]]; then
+        read -p "Your email address: " email
+    fi
+    if [[ -z $company ]]; then
+        read -p "Your company name: " company
     fi
     
+    if [[ -z $license ]]; then
+        print_colored "\nPlease choose a license agreement:" "blue"
+        echo "1. Startup Software License"
+        echo "2. Evaluation Agreement"
+        while true; do
+            read -p "Enter 1 or 2: " choice
+            if [[ $choice == "1" || $choice == "2" ]]; then
+                break
+            fi
+            print_colored "Invalid choice. Please enter 1 or 2." "yellow"
+        done
+        license_type=$([ "$choice" == "1" ] && echo "Startup" || echo "Evaluation")
+    else
+        license_type=$([ "$license" == "startup" ] && echo "Startup" || echo "Evaluation")
+    fi
+    
+    license_url=$([ "$license_type" == "Startup" ] && echo "$STARTUP_LICENSE_URL" || echo "$EVALUATION_LICENSE_URL")
     print_colored "\nPlease review the $license_type License Agreement at:" "blue"
     print_colored "$license_url" "blue"
     
-    read -p "\nDo you agree to the terms and conditions? (yes/no): " agreement
-    agreement=$(echo $agreement | tr '[:upper:]' '[:lower:]')
-}
-
-# Send user data to server (mocked for local testing)
-send_user_data() {
-    installation_id=$(uuidgen 2>/dev/null || echo "test-installation-id-$(date +%s)")
-    print_colored "Sending user data to server (mocked for local testing)..." "blue"
-    print_colored "Installation ID: $installation_id" "green"
-    print_colored "Please keep this ID for your records and support purposes." "yellow"
-    return 0
-}
-
-# Install Hopsworks (mocked for local testing)
-install_hopsworks() {
-    print_colored "Installing Hopsworks (mocked for local testing)..." "blue"
-    print_colored "Hopsworks installation simulated successfully!" "green"
+    if [[ -z $agree ]]; then
+        read -p "\nDo you agree to the terms and conditions? (yes/no): " agreement
+        agree=$(echo $agreement | tr '[:upper:]' '[:lower:]')
+    fi
 }
 
 # Main execution
-check_requirements
+parse_arguments "$@"
+
+print_colored "$HOPSWORKS_LOGO" "blue"
+print_colored "Welcome to the Hopsworks Helm Chart Installer!" "green"
+
+if [[ -z $skip_requirements ]]; then
+    check_requirements
+fi
+
 get_user_info
 
-if [[ $agreement != "yes" ]]; then
+if [[ $agree != "yes" && $agree != "true" ]]; then
     print_colored "You must agree to the terms and conditions to proceed." "red"
     exit 1
 fi
 
 send_user_data
 if [[ $? -ne 0 ]]; then
-    print_colored "Failed to process user information. Do you want to continue anyway? (yes/no)" "yellow"
-    read continue_anyway
-    if [[ $continue_anyway != "yes" ]]; then
-        exit 1
-    fi
+    print_colored "Failed to process user information. Installation cannot proceed." "red"
+    exit 1
 fi
 
 install_hopsworks
 
-print_colored "\nThank you for testing the Hopsworks installation!" "green"
-print_colored "This was a local test run. In a real installation, Hopsworks would now be installed on your system." "blue"
+print_colored "\nThank you for installing Hopsworks!" "green"
 print_colored "If you need any assistance, please contact our support team." "blue"
