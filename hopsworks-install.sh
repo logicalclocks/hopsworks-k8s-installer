@@ -46,10 +46,30 @@ check_requirements() {
     print_colored "System requirements check completed." "green"
 }
 
+# Function to validate email format
+validate_email() {
+    local email=$1
+    if [[ "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 # Get user information
 get_user_info() {
     read -p "Your name: " name
-    read -p "Your email address: " email
+
+    # Ensure valid email
+    while true; do
+        read -p "Your email address: " email
+        if validate_email "$email"; then
+            break
+        else
+            print_colored "Invalid email format. Please enter a valid email." "red"
+        fi
+    done
+
     read -p "Your company name: " company
     
     print_colored "\nPlease choose a license agreement:" "blue"

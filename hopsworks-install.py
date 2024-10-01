@@ -4,6 +4,7 @@ import requests
 import sys
 import os
 import uuid
+import re
 from datetime import datetime
 
 # ASCII art for Hopsworks logo
@@ -55,10 +56,24 @@ def check_requirements():
     
     print_colored("All system requirements are met.", "green")
 
+def is_valid_email(email):
+    email_regex = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+    return re.match(email_regex, email) is not None
+
+def get_valid_email():
+    while True:
+        email = input("Your email address: ")
+        if is_valid_email(email):
+            return email
+        else:
+            print_colored("Invalid email format. Please try again.", "red")
+
 def get_user_info():
     print_colored("\nPlease provide the following information:", "blue")
     name = input("Your name: ")
-    email = input("Your email address: ")
+    
+    email = get_valid_email()
+    
     company = input("Your company name: ")
     
     print_colored("\nPlease choose a license agreement:", "blue")
