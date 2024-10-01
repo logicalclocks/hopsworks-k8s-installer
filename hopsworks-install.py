@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
+import subprocess
+import requests
 import sys
 import os
-import argparse
-import subprocess
 import uuid
 from datetime import datetime
 
@@ -55,56 +55,79 @@ def check_requirements():
     
     print_colored("All system requirements are met.", "green")
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Hopsworks Helm Chart Installer")
-    parser.add_argument("--name", help="Your name")
-    parser.add_argument("--email", help="Your email address")
-    parser.add_argument("--company", help="Your company name")
-    parser.add_argument("--license", choices=["startup", "evaluation"], help="License type")
-    parser.add_argument("--agree", action="store_true", help="Agree to the license terms")
-    parser.add_argument("--skip-requirements", action="store_true", help="Skip requirements check")
-    return parser.parse_args()
-
-def get_user_info(args):
-    if all([args.name, args.email, args.company, args.license, args.agree]):
-        return args.name, args.email, args.company, "Startup" if args.license == "startup" else "Evaluation", args.agree
-
+def get_user_info():
     print_colored("\nPlease provide the following information:", "blue")
-    name = args.name or input("Your name: ")
-    email = args.email or input("Your email address: ")
-    company = args.company or input("Your company name: ")
+    name = input("Your name: ")
+    email = input("Your email address: ")
+    company = input("Your company name: ")
     
-    if not args.license:
-        print_colored("\nPlease choose a license agreement:", "blue")
-        print("1. Startup Software License")
-        print("2. Evaluation Agreement")
-        while True:
-            choice = input("Enter 1 or 2: ")
-            if choice in ['1', '2']:
-                break
-            print_colored("Invalid choice. Please enter 1 or 2.", "yellow")
-        license_type = "Startup" if choice == '1' else "Evaluation"
-    else:
-        license_type = "Startup" if args.license == "startup" else "Evaluation"
+    print_colored("\nPlease choose a license agreement:", "blue")
+    print("1. Startup Software License")
+    print("2. Evaluation Agreement")
     
-    license_url = STARTUP_LICENSE_URL if license_type == "Startup" else EVALUATION_LICENSE_URL
+    while True:
+        choice = input("Enter 1 or 2: ")
+        if choice in ['1', '2']:
+            break
+        print_colored("Invalid choice. Please enter 1 or 2.", "yellow")
+    
+    license_url = STARTUP_LICENSE_URL if choice == '1' else EVALUATION_LICENSE_URL
+    license_type = "Startup" if choice == '1' else "Evaluation"
+    
     print_colored(f"\nPlease review the {license_type} License Agreement at:", "blue")
     print_colored(license_url, "blue")
     
-    agreement = args.agree or input("\nDo you agree to the terms and conditions? (yes/no): ").lower() == 'yes'
+    agreement = input("\nDo you agree to the terms and conditions? (yes/no): ").lower() == 'yes'
     
     return name, email, company, license_type, agreement
+
+def send_user_data(name, email, company, license_type, agreed_to_license):
+    try:
+        installation_id = str(uuid.uuid4())
+        data = {
+            "name": name,
+            "email": email,
+            "company": company,
+            "license_type": license_type,
+            "agreed_to_license": agreed_to_license,
+            "installation_id": installation_id,
+            "action": "install_hopsworks",
+            "installation_date": datetime.now().isoformat()
+        }
+        response = requests.post(SERVER_URL, json=data)
+        response.raise_for_status()
+        return True, installation_id
+    except requests.exceptions.RequestException as e:
+        print_colored(f"Failed to communicate with server: {e}", "red")
+        return False, None
+
+def install_hopsworks():
+    print_colored("Installing Hopsworks...", "blue")
+    
+    helm_commands = [
+        ["helm", "repo", "add", "hopsworks", HELM_REPO],
+        ["helm", "repo", "update"],
+        ["helm", "install", "hopsworks", CHART_NAME]
+    ]
+    
+    for cmd in helm_commands:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print_colored(f"✓ {' '.join(cmd)} executed successfully", "green")
+        else:
+            print_colored(f"✗ Failed to execute {' '.join(cmd)}", "red")
+            print(result.stderr)
+            sys.exit(1)
+    
+    print_colored("Hopsworks installed successfully!", "green")
 
 def main():
     print_colored(HOPSWORKS_LOGO, "blue")
     print_colored("Welcome to the Hopsworks Helm Chart Installer!", "green")
     
-    args = parse_arguments()
+    check_requirements()
     
-    if not args.skip_requirements:
-        check_requirements()
-    
-    name, email, company, license_type, agreement = get_user_info(args)
+    name, email, company, license_type, agreement = get_user_info()
     
     if not agreement:
         print_colored("You must agree to the terms and conditions to proceed.", "red")
@@ -112,11 +135,12 @@ def main():
     
     success, installation_id = send_user_data(name, email, company, license_type, agreement)
     if not success:
-        print_colored("Failed to process user information. Installation cannot proceed.", "red")
-        sys.exit(1)
-    
-    print_colored(f"Installation ID: {installation_id}", "green")
-    print_colored("Please keep this ID for your records and support purposes.", "yellow")
+        print_colored("Failed to process user information. Do you want to continue anyway? (yes/no)", "yellow")
+        if input().lower() != 'yes':
+            sys.exit(1)
+    else:
+        print_colored(f"Installation ID: {installation_id}", "green")
+        print_colored("Please keep this ID for your records and support purposes.", "yellow")
     
     install_hopsworks()
     
