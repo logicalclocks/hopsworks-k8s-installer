@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-import subprocess
-import requests
 import sys
 import os
+import argparse
+import subprocess
 import uuid
 from datetime import datetime
 
