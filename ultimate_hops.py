@@ -39,9 +39,9 @@ HOPSWORKS_LOGO = """
  _   _                                      _        
 | | | |                                    | |       
 | |_| | ___  _ __  _____      _____  _ __  | | _____ 
-|  _  |/ _ \\| '_ \\/ __\\ \\ /\\ / / _ \\| '__| | |/ / __|
-| | | | (_) | |_) \\__ \\\\ V  V / (_) | |    |   <\\__ \\
-\\_| |_/\\___/| .__/|___/ \\_/\\_/ \\___/|_|    |_|\\_\\___/
+|  _  |/ _ \| '_ \/ __\ \ /\ / / _ \| '__| | |/ / __|
+| | | | (_) | |_) \__ \\ V  V / (_) | |    |   <\__ \\
+\_| |_/\___/| .__/|___/ \_/\_/ \___/|_|    |_|\_\___/
             | |                                      
             |_|                                      
 """
@@ -410,44 +410,81 @@ def install_hopsworks_ovh():
         print(output)
         print_colored("\nIf the issue persists, please contact Hopsworks support with the error message and your installation ID.", "yellow")
 
-def setup_port_forwarding(namespace):
-    print_colored("\nSetting up port forwarding...", "blue")
+def setup_ingress(namespace):
+    print_colored("\nSetting up ingress for Hopsworks...", "blue")
     
-    service_name = "hopsworks"
-    cmd = f"kubectl get service {service_name} -n {namespace} -o json"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # Install ingress-nginx via Helm
+    print_colored("Installing ingress-nginx via Helm...", "blue")
+    helm_commands = [
+        "helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx",
+        "helm repo update",
+        "helm -n ingress-nginx install ingress-nginx ingress-nginx/ingress-nginx --create-namespace"
+    ]
+    for cmd in helm_commands:
+        success, output = run_command(cmd)
+        if not success:
+            print_colored("Failed to install ingress-nginx.", "red")
+            sys.exit(1)
+    print_colored("Ingress-nginx installed successfully.", "green")
     
-    if result.returncode != 0:
-        print_colored(f"Failed to get service '{service_name}' in namespace '{namespace}'.", "red")
-        print_colored("Please check the service name and try again.", "yellow")
-        return
+    # Create an ingress resource for Hopsworks
+    print_colored("Creating ingress resource for Hopsworks...", "blue")
+    ingress_yaml = f"""
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hopsworks-ingress
+  namespace: {namespace}
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: hopsworks.ai.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: hopsworks
+            port:
+              number: 8080
+"""
+
+    # Save the ingress YAML to a file
+    with open('hopsworks-ingress.yaml', 'w') as f:
+        f.write(ingress_yaml)
     
-    service = json.loads(result.stdout)
-    ports = service.get('spec', {}).get('ports', [])
-    if not ports:
-        print_colored(f"No ports found for service '{service_name}'.", "red")
-        return
-    port = ports[0]['port']
+    # Apply the ingress YAML
+    success, output = run_command("kubectl apply -f hopsworks-ingress.yaml")
+    if not success:
+        print_colored("Failed to create ingress resource.", "red")
+        sys.exit(1)
+    print_colored("Ingress resource created successfully.", "green")
     
-    local_port = 8080
-    target_port = port
+    # Retrieve the ingress IP address
+    print_colored("Retrieving ingress IP address...", "blue")
+    success, output = run_command(f"kubectl get ingress hopsworks-ingress -n {namespace} -o jsonpath='{{{{.status.loadBalancer.ingress[0].ip}}}}'")
+    if not success or not output.strip():
+        # Try hostname if IP is not available
+        success, output = run_command(f"kubectl get ingress hopsworks-ingress -n {namespace} -o jsonpath='{{{{.status.loadBalancer.ingress[0].hostname}}}}'")
+        if not success or not output.strip():
+            print_colored("Failed to retrieve ingress IP address.", "red")
+            sys.exit(1)
+    ingress_address = output.strip()
     
-    print_colored(f"Forwarding local port {local_port} to service '{service_name}' port {target_port}...", "blue")
-    cmd = f"kubectl port-forward svc/{service_name} -n {namespace} {local_port}:{target_port}"
+    if not ingress_address:
+        print_colored("Ingress address not available yet. Please wait a few moments and try again.", "yellow")
+        ingress_address = input("Enter the ingress IP address or hostname manually: ").strip()
     
-    # Run the command in a subprocess
-    process = subprocess.Popen(cmd, shell=True)
+    # Instruct the user to add an entry to /etc/hosts
+    print_colored("Please add the following entry to your /etc/hosts file:", "blue")
+    print_colored(f"{ingress_address} hopsworks.ai.local", "green")
+    print_colored("This will allow you to access Hopsworks at http://hopsworks.ai.local", "blue")
+    input("Press Enter after you have updated your /etc/hosts file.")
     
-    print_colored(f"Port forwarding set up successfully. You can access Hopsworks UI at http://localhost:{local_port}", "green")
-    print_colored("Press Ctrl+C to stop port forwarding and exit.", "yellow")
-    
-    try:
-        process.wait()
-    except KeyboardInterrupt:
-        print_colored("\nStopping port forwarding...", "blue")
-        process.terminate()
-        process.wait()
-        print_colored("Port forwarding stopped.", "green")
+    print_colored("Ingress setup complete. You can access Hopsworks UI at http://hopsworks.ai.local", "green")
 
 def main():
     print_colored(HOPSWORKS_LOGO, "blue")
@@ -513,8 +550,8 @@ def main():
         print_colored(f"Unsupported cloud provider: {cloud_provider}", "red")
         sys.exit(1)
     
-    # After successful installation, set up port forwarding
-    setup_port_forwarding(namespace)
+    # After successful installation, set up ingress
+    setup_ingress(namespace)
     
     print_colored("\nThank you for installing Hopsworks!", "green")
     print_colored("If you need any assistance, please contact our support team.", "blue")
