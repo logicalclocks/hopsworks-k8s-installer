@@ -4,7 +4,6 @@ import os
 import sys
 from datetime import datetime
 import uuid
-import getpass
 import subprocess
 import json
 import shutil
@@ -54,11 +53,6 @@ SERVER_URL = "https://magiclex--hopsworks-installation-hopsworks-installation.mo
 STARTUP_LICENSE_URL = "https://www.hopsworks.ai/startup-license"
 EVALUATION_LICENSE_URL = "https://www.hopsworks.ai/evaluation-license"
 HOPSWORKS_HELM_REPO_URL = "https://nexus.hops.works/repository/hopsworks-helm/"
-
-NEXUS_USER = "deploy"
-NEXUS_PASSWORD = "t4Jkky7ZsVYU"
-
-HOPSWORKS_CHART_VERSION = "4.0.0-rc1"
 
 def check_requirements():
     print_colored("Checking system requirements...", "blue")
@@ -177,35 +171,11 @@ def setup_kubeconfig():
     print_colored("Kubeconfig setup successful. Connected to the cluster.", "green")
     return default_kubeconfig
 
-def setup_secrets(namespace):
-    print_colored("\nSetting up secrets...", "blue")
-    
-    print_colored("Setting up Docker registry credentials...", "blue")
-    docker_server = "docker.hops.works"
-    docker_username = input("Enter your Nexus username: ")
-    docker_password = getpass.getpass("Enter your Nexus password: ")
-    
-    success, output, error = run_command(f"kubectl create secret docker-registry regcred "
-                f"--namespace={namespace} "
-                f"--docker-server={docker_server} "
-                f"--docker-username={docker_username} "
-                f"--docker-password={docker_password} "
-                f"--dry-run=client -o yaml | kubectl apply -f -")
-    if not success:
-        print_colored("Failed to create Docker registry secret.", "red")
-        print_colored(f"Error: {error}", "red")
-        sys.exit(1)
-    
-    print_colored("Docker registry secret 'regcred' created/updated successfully.", "green")
-
 def install_hopsworks_dev(namespace):
     print_colored("\nPreparing to install Hopsworks (Development Setup)...", "blue")
     
     print_colored("Adding Hopsworks Helm repository...", "blue")
-    helm_repo_add_cmd = (
-        f"helm repo add hopsworks {HOPSWORKS_HELM_REPO_URL} "
-        f"--username {NEXUS_USER} --password {NEXUS_PASSWORD}"
-    )
+    helm_repo_add_cmd = f"helm repo add hopsworks {HOPSWORKS_HELM_REPO_URL}"
     success, output, error = run_command(helm_repo_add_cmd)
     if not success:
         print_colored("Failed to add Helm repository.", "red")
@@ -221,11 +191,11 @@ def install_hopsworks_dev(namespace):
     if os.path.exists('hopsworks'):
         shutil.rmtree('hopsworks')
     
-    print_colored("Downloading and extracting the specified Hopsworks chart version...", "blue")
-    helm_pull_cmd = f"helm pull hopsworks/hopsworks --version {HOPSWORKS_CHART_VERSION} --untar"
+    print_colored("Downloading and extracting the latest Hopsworks chart...", "blue")
+    helm_pull_cmd = "helm pull hopsworks/hopsworks --untar"
     success, output, error = run_command(helm_pull_cmd)
     if not success:
-        print_colored(f"Failed to pull Hopsworks chart version {HOPSWORKS_CHART_VERSION}.", "red")
+        print_colored("Failed to pull Hopsworks chart.", "red")
         print_colored(f"Error: {error}", "red")
         sys.exit(1)
     
@@ -254,38 +224,9 @@ def install_hopsworks_dev(namespace):
 def setup_ingress(namespace):
     print_colored("\nSetting up ingress for Hopsworks...", "blue")
     
-    print_colored("Installing ingress-nginx via Helm...", "blue")
-    helm_commands = [
-        "helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx",
-        "helm repo update",
-        "helm -n ingress-nginx install ingress-nginx ingress-nginx/ingress-nginx --create-namespace"
-    ]
-    for cmd in helm_commands:
-        success, output, error = run_command(cmd)
-        if not success:
-            print_colored("Failed to install ingress-nginx.", "red")
-            print_colored(f"Error: {error}", "red")
-            sys.exit(1)
-    print_colored("Ingress-nginx installed successfully.", "green")
+    print_colored("Please note that ingress setup may vary depending on your cloud provider.", "yellow")
+    print_colored("Ensure that you have an ingress controller installed and properly configured.", "yellow")
     
-    print_colored("Waiting for ingress-nginx admission webhook service to be ready...", "blue")
-    webhook_ready = False
-    for i in range(30):  # Wait up to 5 minutes
-        success, output, error = run_command("kubectl get svc ingress-nginx-controller-admission -n ingress-nginx", verbose=False)
-        if success:
-            success, output, error = run_command("kubectl get endpoints ingress-nginx-controller-admission -n ingress-nginx -o json", verbose=False)
-            if success:
-                endpoints = json.loads(output)
-                if endpoints['subsets']:
-                    webhook_ready = True
-                    print_colored("Ingress-nginx admission webhook service is ready.", "green")
-                    break
-        time.sleep(10)
-    if not webhook_ready:
-        print_colored("Ingress-nginx admission webhook service is not ready after 5 minutes.", "red")
-        sys.exit(1)
-    
-    print_colored("Creating ingress resource for Hopsworks...", "blue")
     hostname = input("Enter the hostname for Hopsworks (default: hopsworks.ai.local): ").strip() or "hopsworks.ai.local"
     ingress_yaml = f"""
 apiVersion: networking.k8s.io/v1
@@ -374,15 +315,6 @@ def delete_namespace(namespace):
 
 def run_installation_diagnostics(namespace):
     print_colored("\nRunning installation diagnostics...", "blue")
-    
-    # Check secrets
-    for secret_name in ['regcred']:
-        success, output, error = run_command(f"kubectl get secret {secret_name} -n {namespace} -o yaml")
-        if success:
-            print_colored(f"Secret '{secret_name}' found:", "green")
-            print(output)
-        else:
-            print_colored(f"Secret '{secret_name}' not found. Error: {error}", "red")
     
     # Check persistent volumes and claims
     success, output, error = run_command("kubectl get pv")
@@ -486,16 +418,10 @@ def main():
             print_colored("Installation cancelled.", "yellow")
             return
     
-    success, output, error = run_command(f"kubectl create namespace {namespace}")
-    if not success:
-        print_colored(f"Failed to create namespace {namespace}.", "red")
-        print_colored(f"Error: {error}", "red")
-        sys.exit(1)
-    
-    setup_secrets(namespace)
-    
+    # Install Hopsworks
     install_hopsworks_dev(namespace)
     
+    # Set up ingress
     setup_ingress(namespace)
     
     # Wait for installation
