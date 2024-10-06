@@ -41,18 +41,18 @@ def get_user_input(prompt, options=None):
             print_colored(f"Invalid input. Expected one of: {', '.join(options)}", "red")
 
 HOPSWORKS_LOGO = """
-██╗  ██╗ ██████╗ ██████╗ ███████╗██╗    ██╗ ██████╗ ██████╗ ██╗  ██╗███████╗
-██║  ██║██╔═══██╗██╔══██╗██╔════╝██║    ██║██╔═══██╗██╔══██╗██║ ██╔╝██╔════╝
-███████║██║   ██║██████╔╝███████╗██║ █╗ ██║██║   ██║██████╔╝█████╔╝ ███████╗ 
-██╔══██║██║   ██║██╔═══╝ ╚════██║██║███╗██║██║   ██║██╔══██╗██╔═██╗ ╚════██║
-██║  ██║╚██████╔╝██║     ███████║╚███╔███╔╝╚██████╔╝██║  ██║██║  ██╗███████║
-╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚══════╝ ╚══╝╚══╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝
+██╗  ██╗    ██████╗    ██████╗    ███████╗   ██╗    ██╗    ██████╗    ██████╗    ██╗  ██╗   ███████╗
+██║  ██║   ██╔═══██╗   ██╔══██╗   ██╔════╝   ██║    ██║   ██╔═══██╗   ██╔══██╗   ██║ ██╔╝   ██╔════╝
+███████║   ██║   ██║   ██████╔╝   ███████╗   ██║ █╗ ██║   ██║   ██║   ██████╔╝   █████╔╝    ███████╗ 
+██╔══██║   ██║   ██║   ██╔═══╝    ╚════██║   ██║███╗██║   ██║   ██║   ██╔══██╗   ██╔═██╗    ╚════██║
+██║  ██║   ╚██████╔╝   ██║        ███████║   ╚███╔███╔╝   ╚██████╔╝   ██║  ██║   ██║  ██╗   ███████║     
+╚═╝  ╚═╝    ╚═════╝    ╚═╝        ╚══════╝    ╚══╝╚══╝     ╚═════╝    ╚═╝  ╚═╝   ╚═╝  ╚═╝   ╚══════╝
 """
 
 SERVER_URL = "https://magiclex--hopsworks-installation-hopsworks-installation.modal.run/"
 STARTUP_LICENSE_URL = "https://www.hopsworks.ai/startup-license"
 EVALUATION_LICENSE_URL = "https://www.hopsworks.ai/evaluation-license"
-HOPSWORKS_HELM_REPO_URL = "https://nexus.hops.works/repository/hopsworks-helm/"
+HOPSWORKS_HELM_REPO_URL = "https://nexus.hops.works/repository/hopsworks-helm"
 
 def check_requirements():
     print_colored("Checking system requirements...", "blue")
@@ -175,7 +175,7 @@ def install_hopsworks_dev(namespace):
     print_colored("\nPreparing to install Hopsworks (Development Setup)...", "blue")
     
     print_colored("Adding Hopsworks Helm repository...", "blue")
-    helm_repo_add_cmd = f"helm repo add hopsworks {HOPSWORKS_HELM_REPO_URL}"
+    helm_repo_add_cmd = f"helm repo add hopsworks {HOPSWORKS_HELM_REPO_URL} --force-update"
     success, output, error = run_command(helm_repo_add_cmd)
     if not success:
         print_colored("Failed to add Helm repository.", "red")
@@ -192,7 +192,7 @@ def install_hopsworks_dev(namespace):
         shutil.rmtree('hopsworks')
     
     print_colored("Downloading and extracting the latest Hopsworks chart...", "blue")
-    helm_pull_cmd = "helm pull hopsworks/hopsworks --untar"
+    helm_pull_cmd = "helm pull hopsworks/hopsworks --untar --devel"
     success, output, error = run_command(helm_pull_cmd)
     if not success:
         print_colored("Failed to pull Hopsworks chart.", "red")
@@ -203,24 +203,51 @@ def install_hopsworks_dev(namespace):
     helm_command = (
         f"helm install hopsworks-release ./hopsworks "
         f"--namespace={namespace} "
+        f"--create-namespace "
         f"--values hopsworks/values.services.yaml "
         f"--values hopsworks/values.yaml "
         f"--values hopsworks/values.dev.yaml "
-        f"--timeout 30m "
+        f"--timeout 60m "
         f"--wait "
-        f"--debug"
+        f"--debug "
+        f"--devel"
     )
     
-    success, output, error = run_command(helm_command)
+    process = subprocess.Popen(helm_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     
-    if success:
+    while True:
+        output = process.stdout.readline()
+        if output == '' and process.poll() is not None:
+            break
+        if output:
+            print(output.strip())
+    
+    rc = process.poll()
+    
+    if rc == 0:
         print_colored("✓ Hopsworks (Development Setup) installed successfully!", "green")
     else:
-        print_colored("✗ Failed to install Hopsworks", "red")
-        print(output)
-        print_colored(f"Error: {error}", "red")
-        print_colored("\nIf the issue persists, please contact Hopsworks support with the error message and your installation ID.", "yellow")
+        print_colored("⚠ Helm command completed with non-zero exit code", "yellow")
+        print_colored("The installation might have partially succeeded. Checking status...", "yellow")
+        
+        # Check the status of the Hopsworks release
+        status_command = f"helm status hopsworks-release -n {namespace}"
+        success, status_output, status_error = run_command(status_command)
+        
+        if success and "STATUS: deployed" in status_output:
+            print_colored("✓ Hopsworks release is showing as deployed!", "green")
+            print_colored("You may need to wait for all pods to be ready.", "yellow")
+        else:
+            print_colored("✗ Hopsworks installation seems to have failed", "red")
+            print_colored("Please check the Helm and Kubernetes logs for more details.", "red")
+        
+        print_colored("\nIf issues persist, please contact Hopsworks support with the error messages and your installation ID.", "yellow")
 
+    # Always show the status of pods after installation attempt
+    print_colored("\nChecking status of pods in the hopsworks namespace:", "blue")
+    pod_status_command = f"kubectl get pods -n {namespace}"
+    run_command(pod_status_command)
+    
 def setup_ingress(namespace):
     print_colored("\nSetting up ingress for Hopsworks...", "blue")
     
@@ -235,9 +262,9 @@ metadata:
   name: hopsworks-ingress
   namespace: {namespace}
   annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
 spec:
-  ingressClassName: nginx
   rules:
   - host: {hostname}
     http:
@@ -246,9 +273,9 @@ spec:
         pathType: Prefix
         backend:
           service:
-            name: hopsworks
-            port:
-              number: 8182
+            name: hopsworks-release-http
+            port: 
+              number: 28080
 """
     with open('hopsworks-ingress.yaml', 'w') as f:
         f.write(ingress_yaml)
@@ -273,16 +300,31 @@ spec:
                 ingress_address = output.strip()
                 break
         time.sleep(10)
+    
     if not ingress_address:
-        print_colored("Ingress address not available yet. Please wait a few moments and try again.", "yellow")
-        ingress_address = input("Enter the ingress IP address or hostname manually: ").strip()
+        print_colored("Ingress address not available yet. Attempting to retrieve from service...", "yellow")
+        success, output, error = run_command(f"kubectl get service istio-ingressgateway -n {namespace} -o jsonpath='{{.status.loadBalancer.ingress[0].ip}}'", verbose=False)
+        if success and output.strip():
+            ingress_address = output.strip()
+        else:
+            success, output, error = run_command(f"kubectl get service istio-ingressgateway -n {namespace} -o jsonpath='{{.status.loadBalancer.ingress[0].hostname}}'", verbose=False)
+            if success and output.strip():
+                ingress_address = output.strip()
+    
+    if not ingress_address:
+        print_colored("Unable to automatically retrieve the ingress address.", "yellow")
+        ingress_address = input("Please enter the ingress IP address or hostname manually: ").strip()
     
     print_colored("Please add the following entry to your /etc/hosts file:", "blue")
     print_colored(f"{ingress_address} {hostname}", "green")
-    print_colored(f"This will allow you to access Hopsworks at https://{hostname}", "blue")
+    print_colored(f"This will allow you to access Hopsworks at http://{hostname}", "blue")
     input("Press Enter after you have updated your /etc/hosts file.")
     
-    print_colored(f"Ingress setup complete. You can access Hopsworks UI at https://{hostname}", "green")
+    print_colored(f"Ingress setup complete. You can access Hopsworks UI at http://{hostname}", "green")
+    print_colored("Note: It may take a few minutes for the ingress to become fully operational.", "yellow")
+    
+    return hostname, ingress_address
+
 
 def wait_for_installation(namespace, timeout=1800):
     print_colored("\nWaiting for Hopsworks installation to complete...", "blue")
@@ -422,7 +464,7 @@ def main():
     install_hopsworks_dev(namespace)
     
     # Set up ingress
-    setup_ingress(namespace)
+    hostname, ingress_address = setup_ingress(namespace)
     
     # Wait for installation
     if not wait_for_installation(namespace):
@@ -441,6 +483,9 @@ def main():
                 print_colored("Invalid choice. Please enter 'w', 'd', or 'c'.", "red")
     
     print_colored("\nInstallation completed successfully!", "green")
+    print_colored(f"Hopsworks is accessible at: http://{hostname}", "green")
+    print_colored(f"Ingress address: {ingress_address}", "green")
+    print_colored("Note: It may take a few minutes for all services to become fully operational.", "yellow")
     print_colored("If you need any assistance, please contact our support team.", "blue")
     
     # Offer to run diagnostics
@@ -449,6 +494,9 @@ def main():
     
     if run_diagnostics:
         run_installation_diagnostics(namespace)
+    
+    print_colored(f"\nInstallation completed. Your installation ID is: {installation_id}", "green")
+    print_colored("Please keep this ID for your records and support purposes.", "yellow")
 
 if __name__ == "__main__":
     main()
