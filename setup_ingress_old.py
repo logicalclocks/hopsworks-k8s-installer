@@ -3,6 +3,8 @@
 import subprocess
 import time
 import sys
+import yaml
+import os
 
 def print_colored(message, color):
     colors = {
@@ -31,6 +33,20 @@ def get_yes_no_input(prompt):
             return False
         else:
             print_colored("Please enter 'yes' or 'no'.", "yellow")
+
+def ensure_namespace_exists(namespace):
+    success, _, _ = run_command(f"kubectl get namespace {namespace}", verbose=False)
+    if not success:
+        print_colored(f"The {namespace} namespace does not exist. Creating it now...", "yellow")
+        success, _, error = run_command(f"kubectl create namespace {namespace}")
+        if not success:
+            print_colored(f"Failed to create {namespace} namespace.", "red")
+            print_colored(f"Error: {error}", "red")
+            return False
+        print_colored(f"{namespace} namespace created successfully.", "green")
+    else:
+        print_colored(f"{namespace} namespace already exists.", "green")
+    return True
 
 def install_nginx_ingress_controller():
     print_colored("Installing NGINX Ingress Controller...", "blue")
@@ -92,6 +108,7 @@ def update_etc_hosts(ingress_address, hostname):
     hosts_entry = f"{ingress_address} {hostname}"
     
     try:
+        # Try to update /etc/hosts without sudo first
         with open('/etc/hosts', 'a') as hosts_file:
             hosts_file.write(f"\n{hosts_entry}\n")
         print_colored("Successfully updated /etc/hosts file.", "green")
@@ -119,6 +136,9 @@ def update_etc_hosts(ingress_address, hostname):
 def setup_ingress(namespace):
     print_colored("\nSetting up ingress for Hopsworks...", "blue")
     
+    if not ensure_namespace_exists("ingress-nginx"):
+        sys.exit(1)
+
     success, _, _ = run_command("kubectl get pods -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx-controller", verbose=False)
     if not success:
         print_colored("NGINX Ingress Controller is not installed or not ready.", "yellow")
@@ -149,38 +169,68 @@ def setup_ingress(namespace):
     
     hostname = input("Enter the hostname for Hopsworks (default: hopsworks.ai.local): ").strip() or "hopsworks.ai.local"
     
-    ingress_yaml = f"""
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: hopsworks-ingress
-  namespace: {namespace}
-  annotations:
-    nginx.ingress.kubernetes.io/ssl-redirect: "false"
-spec:
-  ingressClassName: nginx
-  rules:
-  - host: {hostname}
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: hopsworks-release-http
-            port: 
-              number: 28080
-"""
+    # Check if any ingress already exists with the same host
+    success, output, _ = run_command(f"kubectl get ingress -n {namespace} -o jsonpath='{{.items[?(@.spec.rules[0].host==\"{hostname}\")].metadata.name}}'", verbose=False)
+    existing_ingress = output.strip() if success else None
+
+    ingress_yaml = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "Ingress",
+        "metadata": {
+            "name": "hopsworks-ingress",
+            "namespace": namespace,
+            "annotations": {
+                "nginx.ingress.kubernetes.io/ssl-redirect": "false"
+            }
+        },
+        "spec": {
+            "ingressClassName": "nginx",
+            "rules": [
+                {
+                    "host": hostname,
+                    "http": {
+                        "paths": [
+                            {
+                                "path": "/",
+                                "pathType": "Prefix",
+                                "backend": {
+                                    "service": {
+                                        "name": "hopsworks-release-http",
+                                        "port": {
+                                            "number": 28080
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    }
     
     with open('hopsworks-ingress.yaml', 'w') as f:
-        f.write(ingress_yaml)
+        yaml.dump(ingress_yaml, f)
     
-    success, _, error = run_command(f"kubectl apply -f hopsworks-ingress.yaml -n {namespace}")
-    if not success:
-        print_colored("Failed to create/update ingress resource.", "red")
-        print_colored(f"Error: {error}", "red")
-        sys.exit(1)
-    print_colored("Ingress resource created/updated successfully.", "green")
+    if existing_ingress:
+        print_colored(f"An ingress resource '{existing_ingress}' already exists for host '{hostname}'.", "yellow")
+        update = get_yes_no_input("Do you want to update the existing ingress? (yes/no): ")
+        if update:
+            success, _, error = run_command(f"kubectl apply -f hopsworks-ingress.yaml -n {namespace}")
+            if not success:
+                print_colored("Failed to update ingress resource.", "red")
+                print_colored(f"Error: {error}", "red")
+                sys.exit(1)
+            print_colored("Ingress resource updated successfully.", "green")
+        else:
+            print_colored("Ingress update skipped. Using existing ingress configuration.", "yellow")
+    else:
+        success, _, error = run_command(f"kubectl create -f hopsworks-ingress.yaml -n {namespace}")
+        if not success:
+            print_colored("Failed to create ingress resource.", "red")
+            print_colored(f"Error: {error}", "red")
+            sys.exit(1)
+        print_colored("Ingress resource created successfully.", "green")
     
     print_colored("\nTo access Hopsworks, you need to add an entry to your /etc/hosts file.", "blue")
     print_colored("Here's the line you need to add:", "yellow")
@@ -197,7 +247,16 @@ spec:
     
     return hostname, ingress_address
 
-def main():
+if __name__ == "__main__":
+    # Check if the script is run with sudo
+    if os.geteuid() == 0:
+        print_colored("This script is running with sudo privileges.", "yellow")
+        print_colored("For security reasons, it's recommended to run without sudo initially.", "yellow")
+        continue_with_sudo = get_yes_no_input("Do you want to continue running with sudo? (yes/no): ")
+        if not continue_with_sudo:
+            print_colored("Please run the script without sudo. It will ask for sudo privileges when necessary.", "green")
+            sys.exit(0)
+    
     namespace = input("Enter the namespace where Hopsworks is installed (default: hopsworks): ").strip() or "hopsworks"
     hostname, ingress_address = setup_ingress(namespace)
     print_colored("\nIngress setup completed successfully!", "green")
@@ -205,6 +264,3 @@ def main():
     print_colored(f"Ingress address: {ingress_address}", "green")
     print_colored("\nIf you didn't update your /etc/hosts file, remember to add this line:", "yellow")
     print_colored(f"{ingress_address} {hostname}", "green")
-
-if __name__ == "__main__":
-    main()
