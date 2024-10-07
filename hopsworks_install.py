@@ -7,6 +7,10 @@ import urllib.request
 import uuid
 from datetime import datetime
 import json
+import ssl
+
+# Disable SSL certificate verification (Note: This is not recommended for production use)
+ssl._create_default_https_context = ssl._create_unverified_context
 
 BASE_URL = "https://raw.githubusercontent.com/MagicLex/hopsworks-k8s-installer/refs/heads/master/"
 SERVER_URL = "https://magiclex--hopsworks-installation-hopsworks-installation.modal.run/"
