@@ -3,14 +3,10 @@
 import os
 import sys
 import subprocess
-import urllib.request
 import uuid
 from datetime import datetime
 import json
-import ssl
-
-# Disable SSL certificate verification (Note: This is not recommended for production use)
-ssl._create_default_https_context = ssl._create_unverified_context
+import requests
 
 BASE_URL = "https://raw.githubusercontent.com/MagicLex/hopsworks-k8s-installer/refs/heads/master/"
 SERVER_URL = "https://magiclex--hopsworks-installation-hopsworks-installation.modal.run/"
@@ -78,13 +74,11 @@ def send_user_data(name, email, company, license_type, agreed_to_license):
         "installation_date": datetime.now().isoformat()
     }
     try:
-        data_json = json.dumps(data).encode('utf-8')
-        req = urllib.request.Request(SERVER_URL, data=data_json, headers={'Content-Type': 'application/json'})
-        with urllib.request.urlopen(req) as response:
-            response.read().decode('utf-8')
-            print_colored("User data sent successfully.", "green")
-            return True, installation_id
-    except urllib.error.URLError as e:
+        response = requests.post(SERVER_URL, json=data, verify=False)
+        response.raise_for_status()
+        print_colored("User data sent successfully.", "green")
+        return True, installation_id
+    except requests.RequestException as e:
         print_colored(f"Failed to communicate with server: {e}", "red")
         return False, None
 
@@ -92,10 +86,13 @@ def download_script(script_name):
     url = BASE_URL + script_name
     local_path = script_name
     try:
-        urllib.request.urlretrieve(url, local_path)
+        response = requests.get(url, verify=False)
+        response.raise_for_status()
+        with open(local_path, 'wb') as f:
+            f.write(response.content)
         os.chmod(local_path, 0o755)
         return local_path
-    except Exception as e:
+    except requests.RequestException as e:
         print_colored(f"Failed to download {script_name}: {e}", "red")
         return None
 
