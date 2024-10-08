@@ -247,22 +247,15 @@ def wait_for_pods_ready(namespace, timeout=1800):  # 30 minutes timeout
     return False
 
 def get_hopsworks_url(namespace):
-    cmd = f"kubectl get ingress -n {namespace} -o json"
-    success, output, _ = run_command(cmd, verbose=False)
-    if success:
-        try:
-            ingress_data = json.loads(output)
-            items = ingress_data.get('items', [])
-            if items:
-                ingress = items[0]
-                rules = ingress['spec'].get('rules', [])
-                if rules:
-                    host = rules[0].get('host', '')
-                    if host:
-                        return f"https://{host}"
-        except json.JSONDecodeError:
-            print_colored("Failed to parse ingress JSON output.", "red")
-    return None
+    cmd = f"kubectl get ingress -n {namespace} -o jsonpath='{{{{.items[0].spec.rules[0].host}}}}'"
+    success, host_output, _ = run_command(cmd, verbose=False)
+    if success and host_output.strip():
+        host = host_output.strip()
+    else:
+        print_colored("Failed to retrieve Hopsworks URL from ingress. Defaulting to hopsworks.ai.local", "yellow")
+        host = "hopsworks.ai.local"
+
+    return f"https://{host}"
 
 def check_ingress_controller():
     print_colored("\nChecking for an existing ingress controller...", "blue")
@@ -310,26 +303,34 @@ def wait_for_ingress_address(namespace, timeout=600):
     print_colored("\nWaiting for ingress address to be assigned...", "yellow")
     start_time = time.time()
     while time.time() - start_time < timeout:
-        # Get the ingress address from the ingress resource
-        cmd = f"kubectl get ingress -n {namespace} -o jsonpath='{{.items[0].status.loadBalancer.ingress[0].ip}}'"
-        success, ip_output, _ = run_command(cmd, verbose=False)
-        cmd = f"kubectl get ingress -n {namespace} -o jsonpath='{{.items[0].status.loadBalancer.ingress[0].hostname}}'"
-        success_hostname, hostname_output, _ = run_command(cmd, verbose=False)
-        ingress_address = ip_output.strip() or hostname_output.strip()
+        # First, try to get the ingress address from the ingress resource
+        cmd_ip = f"kubectl get ingress -n {namespace} -o jsonpath='{{{{.items[0].status.loadBalancer.ingress[0].ip}}}}'"
+        cmd_hostname = f"kubectl get ingress -n {namespace} -o jsonpath='{{{{.items[0].status.loadBalancer.ingress[0].hostname}}}}'"
+
+        success_ip, ip_output, _ = run_command(cmd_ip, verbose=False)
+        success_hostname, hostname_output, _ = run_command(cmd_hostname, verbose=False)
+
+        ingress_address = ip_output.strip() if ip_output.strip() else hostname_output.strip()
+
         if ingress_address:
             print_colored(f"Ingress address found: {ingress_address}", "green")
             return ingress_address
         else:
-            # Get the EXTERNAL-IP from ingress-nginx-controller service
-            cmd = "kubectl get service ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}'"
-            success, svc_ip_output, _ = run_command(cmd, verbose=False)
-            cmd = "kubectl get service ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
-            success_hostname, svc_hostname_output, _ = run_command(cmd, verbose=False)
-            svc_ingress_address = svc_ip_output.strip() or svc_hostname_output.strip()
+            # If not found, try to get the EXTERNAL-IP from the ingress-nginx-controller service
+            cmd_svc_ip = "kubectl get service ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}'"
+            cmd_svc_hostname = "kubectl get service ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+            success_svc_ip, svc_ip_output, _ = run_command(cmd_svc_ip, verbose=False)
+            success_svc_hostname, svc_hostname_output, _ = run_command(cmd_svc_hostname, verbose=False)
+
+            svc_ingress_address = svc_ip_output.strip() if svc_ip_output.strip() else svc_hostname_output.strip()
+
             if svc_ingress_address:
                 print_colored(f"Ingress controller address found: {svc_ingress_address}", "green")
                 return svc_ingress_address
-        time.sleep(10)
+            else:
+                print_colored("Ingress address not yet assigned. Waiting...", "yellow")
+                time.sleep(10)
+
     print_colored("Timed out waiting for ingress address to be assigned.", "red")
     return None
 
@@ -350,19 +351,38 @@ def wait_for_ingress(namespace, ingress_host, timeout=600):
 
 def update_hosts_file(ingress_address, ingress_host):
     print_colored("\nTo access Hopsworks UI, you may need to update your /etc/hosts file.", "yellow")
-    print_colored(f"Add the following entry to your /etc/hosts file:", "cyan")
-    print_colored(f"{ingress_address} {ingress_host}", "green")
+    print_colored("Add the following entry to your /etc/hosts file:", "cyan")
+    hosts_entry = f"{ingress_address} {ingress_host}"
+    print_colored(hosts_entry, "green")
     update_hosts = get_user_input("Would you like the script to attempt to update your /etc/hosts file? (yes/no):", ["yes", "no"]).lower() == "yes"
     if update_hosts:
         try:
             with open("/etc/hosts", "a") as hosts_file:
-                hosts_file.write(f"\n{ingress_address} {ingress_host}\n")
+                hosts_file.write(f"\n{hosts_entry}\n")
             print_colored("Successfully updated /etc/hosts.", "green")
         except PermissionError:
-            print_colored("Permission denied when trying to update /etc/hosts.", "red")
-            print_colored("Please run the script as root or manually update /etc/hosts.", "yellow")
+            print_colored("Permission denied when trying to update /etc/hosts.", "yellow")
+            use_sudo = get_user_input("Do you want to try updating /etc/hosts using sudo? (yes/no): ", ["yes", "no"]).lower() == "yes"
+            if use_sudo:
+                sudo_command = f"echo '{hosts_entry}' | sudo tee -a /etc/hosts"
+                success, _, error = run_command(sudo_command)
+                if success:
+                    print_colored("Successfully updated /etc/hosts using sudo.", "green")
+                else:
+                    print_colored("Failed to update /etc/hosts even with sudo.", "red")
+                    print_colored(f"Error: {error}", "red")
+                    print_colored("Please manually add the following entry to your /etc/hosts file:", "yellow")
+                    print_colored(hosts_entry, "green")
+            else:
+                print_colored("Please manually add the following entry to your /etc/hosts file.", "yellow")
+                print_colored(hosts_entry, "green")
+        except Exception as e:
+            print_colored(f"An unexpected error occurred: {str(e)}", "red")
+            print_colored("Please manually add the following entry to your /etc/hosts file.", "yellow")
+            print_colored(hosts_entry, "green")
     else:
-        print_colored("Please manually add the entry to your /etc/hosts file.", "yellow")
+        print_colored("Please manually add the following entry to your /etc/hosts file.", "yellow")
+        print_colored(hosts_entry, "green")
 
 def main():
     parser = argparse.ArgumentParser(description="Hopsworks Installation Script")
@@ -413,6 +433,7 @@ def main():
     hopsworks_url = get_hopsworks_url(namespace)
     if not hopsworks_url:
         print_colored("Unable to determine Hopsworks URL. Please check your ingress configuration.", "yellow")
+        sys.exit(1)
     else:
         ingress_host = hopsworks_url.replace("https://", "")
         update_hosts_file(ingress_address, ingress_host)

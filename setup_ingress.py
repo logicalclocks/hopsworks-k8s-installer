@@ -3,6 +3,7 @@
 import subprocess
 import time
 import sys
+import os
 
 def print_colored(message, color):
     colors = {
@@ -31,6 +32,26 @@ def get_yes_no_input(prompt):
             return False
         else:
             print_colored("Please enter 'yes' or 'no'.", "yellow")
+
+def ensure_namespace_exists(namespace):
+    success, _, _ = run_command(f"kubectl get namespace {namespace}", verbose=False)
+    if not success:
+        print_colored(f"The {namespace} namespace does not exist. Creating it now...", "yellow")
+        success, _, _ = run_command(f"kubectl create namespace {namespace}")
+        if not success:
+            return False
+        print_colored(f"{namespace} namespace created successfully.", "green")
+    else:
+        print_colored(f"{namespace} namespace already exists.", "green")
+    
+    # Wait for namespace to be fully created
+    for _ in range(30):  # Wait up to 30 seconds
+        success, output, _ = run_command(f"kubectl get namespace {namespace} -o jsonpath='{{.status.phase}}'", verbose=False)
+        if success and output.strip() == "Active":
+            return True
+        time.sleep(1)
+    print_colored(f"Timeout waiting for {namespace} namespace to become active.", "red")
+    return False
 
 def install_nginx_ingress_controller():
     print_colored("Installing NGINX Ingress Controller...", "blue")
@@ -71,9 +92,10 @@ def wait_for_nginx_ingress_ready():
     print_colored("Timed out waiting for NGINX Ingress Controller pods to be ready.", "red")
     return False
 
-def get_ingress_address():
+def get_ingress_address(timeout=600):
     print_colored("Retrieving LoadBalancer IP or hostname...", "blue")
-    for _ in range(30):  # Try for 5 minutes
+    start_time = time.time()
+    while time.time() - start_time < timeout:
         success, output, _ = run_command("kubectl get service ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}'", verbose=False)
         if success and output.strip():
             return output.strip()
@@ -87,6 +109,58 @@ def get_ingress_address():
     
     print_colored("Failed to retrieve LoadBalancer IP or hostname.", "red")
     return None
+
+def check_existing_ingress(namespace, hostname):
+    success, output, _ = run_command(f"kubectl get ingress -n {namespace} -o jsonpath='{{.items[?(@.spec.rules[0].host==\"{hostname}\")].metadata.name}}'", verbose=False)
+    return output.strip() if success else None
+
+def create_ingress_yaml(namespace, hostname):
+    return f"""
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hopsworks-ingress
+  namespace: {namespace}
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: {hostname}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: hopsworks-release-http
+            port: 
+              number: 28080
+"""
+
+def update_ingress(namespace, hostname, existing_ingress):
+    ingress_yaml = create_ingress_yaml(namespace, hostname)
+    with open('hopsworks-ingress.yaml', 'w') as f:
+        f.write(ingress_yaml)
+    success, _, error = run_command(f"kubectl apply -f hopsworks-ingress.yaml -n {namespace}")
+    if not success:
+        print_colored("Failed to update ingress resource.", "red")
+        print_colored(f"Error: {error}", "red")
+        return False
+    print_colored("Ingress resource updated successfully.", "green")
+    return True
+
+def create_ingress(namespace, hostname):
+    ingress_yaml = create_ingress_yaml(namespace, hostname)
+    with open('hopsworks-ingress.yaml', 'w') as f:
+        f.write(ingress_yaml)
+    success, _, error = run_command(f"kubectl create -f hopsworks-ingress.yaml -n {namespace}")
+    if not success:
+        print_colored("Failed to create ingress resource.", "red")
+        print_colored(f"Error: {error}", "red")
+        return False
+    print_colored("Ingress resource created successfully.", "green")
+    return True
 
 def update_etc_hosts(ingress_address, hostname):
     hosts_entry = f"{ingress_address} {hostname}"
@@ -119,6 +193,10 @@ def update_etc_hosts(ingress_address, hostname):
 def setup_ingress(namespace):
     print_colored("\nSetting up ingress for Hopsworks...", "blue")
     
+    if not ensure_namespace_exists("ingress-nginx"):
+        print_colored("Failed to create or verify ingress-nginx namespace. Exiting.", "red")
+        return
+
     success, _, _ = run_command("kubectl get pods -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx-controller", verbose=False)
     if not success:
         print_colored("NGINX Ingress Controller is not installed or not ready.", "yellow")
@@ -149,39 +227,22 @@ def setup_ingress(namespace):
     
     hostname = input("Enter the hostname for Hopsworks (default: hopsworks.ai.local): ").strip() or "hopsworks.ai.local"
     
-    ingress_yaml = f"""
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: hopsworks-ingress
-  namespace: {namespace}
-  annotations:
-    nginx.ingress.kubernetes.io/ssl-redirect: "false"
-spec:
-  ingressClassName: nginx
-  rules:
-  - host: {hostname}
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: hopsworks-release-http
-            port: 
-              number: 28080
-"""
-    
-    with open('hopsworks-ingress.yaml', 'w') as f:
-        f.write(ingress_yaml)
-    
-    success, _, error = run_command(f"kubectl apply -f hopsworks-ingress.yaml -n {namespace}")
+    existing_ingress = check_existing_ingress(namespace, hostname)
+    if existing_ingress:
+        print_colored(f"An ingress resource '{existing_ingress}' already exists for host '{hostname}'.", "yellow")
+        update = get_yes_no_input("Do you want to update the existing ingress? (yes/no): ")
+        if update:
+            success = update_ingress(namespace, hostname, existing_ingress)
+        else:
+            print_colored("Ingress update skipped. Using existing ingress configuration.", "yellow")
+            success = True
+    else:
+        success = create_ingress(namespace, hostname)
+
     if not success:
-        print_colored("Failed to create/update ingress resource.", "red")
-        print_colored(f"Error: {error}", "red")
-        sys.exit(1)
-    print_colored("Ingress resource created/updated successfully.", "green")
-    
+        print_colored("Failed to set up ingress. Please check your cluster configuration.", "red")
+        return
+
     print_colored("\nTo access Hopsworks, you need to add an entry to your /etc/hosts file.", "blue")
     print_colored("Here's the line you need to add:", "yellow")
     print_colored(f"\n{ingress_address} {hostname}\n", "green")

@@ -29,13 +29,16 @@ def print_colored(message, color):
 def run_command(command, verbose=True, timeout=300):
     if verbose:
         print_colored(f"Running command: {command}", "cyan")
+    start_time = time.time()
     try:
         result = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+        duration = time.time() - start_time
         if verbose:
             if result.stdout:
                 print(result.stdout)
             if result.stderr:
                 print_colored(result.stderr, "yellow")
+            print_colored(f"Command completed in {duration:.2f} seconds", "green")
         return result.returncode == 0, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
         print_colored(f"Command timed out after {timeout} seconds: {command}", "red")
@@ -172,6 +175,7 @@ def modify_dev_yaml():
 
 def install_hopsworks(namespace):
     print_colored("\nInstalling Hopsworks...", "blue")
+    print_colored("This may take several minutes to complete. Please be patient.", "yellow")
     
     if not run_command("helm repo add hopsworks https://nexus.hops.works/repository/hopsworks-helm --force-update")[0]:
         print_colored("Failed to add Hopsworks Helm repo. Check your internet connection and try again.", "red")
@@ -192,6 +196,7 @@ def install_hopsworks(namespace):
     if not modify_dev_yaml():
         print_colored("Failed to modify dev YAML. Continuing with default settings.", "yellow")
     
+    print_colored("Starting Hopsworks installation. This process may take up to an hour. Please be patient and do not interrupt.", "yellow")
     helm_command = (
         f"helm install hopsworks-release ./hopsworks "
         f"--namespace={namespace} "
@@ -213,9 +218,20 @@ def install_hopsworks(namespace):
         print_colored("Hopsworks installation command failed. Check the logs for details.", "red")
         print_colored(f"Error: {error}", "red")
         return False
-    
+
     print_colored("Waiting for Hopsworks pods to be ready...", "yellow")
-    return wait_for_pods_ready(namespace)
+    pods_ready = wait_for_pods_ready(namespace)
+    
+    if pods_ready:
+        print_colored("Hopsworks pods are ready.", "green")
+    else:
+        print_colored("Some pods did not become ready in time.", "red")
+        print_colored("You may need to check the status of the pods and address any issues.", "yellow")
+        # Decide whether to continue or exit
+        # For now, continue to the next step
+    
+    print_colored("Proceeding to setup ingress...", "blue")
+    return True
 
 def wait_for_pods_ready(namespace, timeout=1800):  # 30 minutes timeout
     print_colored(f"Waiting for pods in namespace '{namespace}' to be ready...", "yellow")
@@ -228,13 +244,20 @@ def wait_for_pods_ready(namespace, timeout=1800):  # 30 minutes timeout
                 pods = json.loads(output)['items']
                 total_pods = len(pods)
                 ready_pods = 0
+                failed_pods = []
                 for pod in pods:
                     pod_phase = pod['status'].get('phase', '')
+                    pod_name = pod['metadata'].get('name', '')
                     if pod_phase in ['Running', 'Succeeded']:
                         ready_pods += 1
+                    elif pod_phase == 'Failed':
+                        failed_pods.append(pod_name)
                 if total_pods > 0:
                     readiness = (ready_pods / total_pods) * 100
                     print_colored(f"Pods readiness: {readiness:.2f}% ({ready_pods}/{total_pods})", "green")
+                    if failed_pods:
+                        print_colored(f"The following pods have failed: {', '.join(failed_pods)}", "red")
+                        print_colored("You may need to delete these pods to allow Kubernetes to recreate them.", "yellow")
                     if readiness >= 80:
                         print_colored("Sufficient pods are ready!", "green")
                         return True
@@ -242,27 +265,22 @@ def wait_for_pods_ready(namespace, timeout=1800):  # 30 minutes timeout
                     print_colored("No pods found. Waiting...", "yellow")
             except json.JSONDecodeError as e:
                 print_colored(f"Failed to parse pod status JSON: {str(e)}", "red")
+        else:
+            print_colored("Failed to get pods status. Retrying...", "yellow")
         time.sleep(10)
     print_colored(f"Timed out waiting for pods to be ready in namespace '{namespace}'", "red")
     return False
 
 def get_hopsworks_url(namespace):
-    cmd = f"kubectl get ingress -n {namespace} -o json"
-    success, output, _ = run_command(cmd, verbose=False)
-    if success:
-        try:
-            ingress_data = json.loads(output)
-            items = ingress_data.get('items', [])
-            if items:
-                ingress = items[0]
-                rules = ingress['spec'].get('rules', [])
-                if rules:
-                    host = rules[0].get('host', '')
-                    if host:
-                        return f"https://{host}"
-        except json.JSONDecodeError:
-            print_colored("Failed to parse ingress JSON output.", "red")
-    return None
+    cmd = f"kubectl get ingress -n {namespace} -o jsonpath='{{{{.items[0].spec.rules[0].host}}}}'"
+    success, host_output, _ = run_command(cmd, verbose=False)
+    if success and host_output.strip():
+        host = host_output.strip()
+    else:
+        print_colored("Failed to retrieve Hopsworks URL from ingress. Defaulting to hopsworks.ai.local", "yellow")
+        host = "hopsworks.ai.local"
+
+    return f"https://{host}"
 
 def check_ingress_controller():
     print_colored("\nChecking for an existing ingress controller...", "blue")
@@ -310,26 +328,34 @@ def wait_for_ingress_address(namespace, timeout=600):
     print_colored("\nWaiting for ingress address to be assigned...", "yellow")
     start_time = time.time()
     while time.time() - start_time < timeout:
-        # Get the ingress address from the ingress resource
-        cmd = f"kubectl get ingress -n {namespace} -o jsonpath='{{.items[0].status.loadBalancer.ingress[0].ip}}'"
-        success, ip_output, _ = run_command(cmd, verbose=False)
-        cmd = f"kubectl get ingress -n {namespace} -o jsonpath='{{.items[0].status.loadBalancer.ingress[0].hostname}}'"
-        success_hostname, hostname_output, _ = run_command(cmd, verbose=False)
-        ingress_address = ip_output.strip() or hostname_output.strip()
+        # First, try to get the ingress address from the ingress resource
+        cmd_ip = f"kubectl get ingress -n {namespace} -o jsonpath='{{{{.items[0].status.loadBalancer.ingress[0].ip}}}}'"
+        cmd_hostname = f"kubectl get ingress -n {namespace} -o jsonpath='{{{{.items[0].status.loadBalancer.ingress[0].hostname}}}}'"
+
+        success_ip, ip_output, _ = run_command(cmd_ip, verbose=False)
+        success_hostname, hostname_output, _ = run_command(cmd_hostname, verbose=False)
+
+        ingress_address = ip_output.strip() if ip_output.strip() else hostname_output.strip()
+
         if ingress_address:
             print_colored(f"Ingress address found: {ingress_address}", "green")
             return ingress_address
         else:
-            # Get the EXTERNAL-IP from ingress-nginx-controller service
-            cmd = "kubectl get service ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}'"
-            success, svc_ip_output, _ = run_command(cmd, verbose=False)
-            cmd = "kubectl get service ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
-            success_hostname, svc_hostname_output, _ = run_command(cmd, verbose=False)
-            svc_ingress_address = svc_ip_output.strip() or svc_hostname_output.strip()
+            # If not found, try to get the EXTERNAL-IP from the ingress-nginx-controller service
+            cmd_svc_ip = "kubectl get service ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}'"
+            cmd_svc_hostname = "kubectl get service ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+            success_svc_ip, svc_ip_output, _ = run_command(cmd_svc_ip, verbose=False)
+            success_svc_hostname, svc_hostname_output, _ = run_command(cmd_svc_hostname, verbose=False)
+
+            svc_ingress_address = svc_ip_output.strip() if svc_ip_output.strip() else svc_hostname_output.strip()
+
             if svc_ingress_address:
                 print_colored(f"Ingress controller address found: {svc_ingress_address}", "green")
                 return svc_ingress_address
-        time.sleep(10)
+            else:
+                print_colored("Ingress address not yet assigned. Waiting...", "yellow")
+                time.sleep(10)
+
     print_colored("Timed out waiting for ingress address to be assigned.", "red")
     return None
 
@@ -350,19 +376,38 @@ def wait_for_ingress(namespace, ingress_host, timeout=600):
 
 def update_hosts_file(ingress_address, ingress_host):
     print_colored("\nTo access Hopsworks UI, you may need to update your /etc/hosts file.", "yellow")
-    print_colored(f"Add the following entry to your /etc/hosts file:", "cyan")
-    print_colored(f"{ingress_address} {ingress_host}", "green")
+    print_colored("Add the following entry to your /etc/hosts file:", "cyan")
+    hosts_entry = f"{ingress_address} {ingress_host}"
+    print_colored(hosts_entry, "green")
     update_hosts = get_user_input("Would you like the script to attempt to update your /etc/hosts file? (yes/no):", ["yes", "no"]).lower() == "yes"
     if update_hosts:
         try:
             with open("/etc/hosts", "a") as hosts_file:
-                hosts_file.write(f"\n{ingress_address} {ingress_host}\n")
+                hosts_file.write(f"\n{hosts_entry}\n")
             print_colored("Successfully updated /etc/hosts.", "green")
         except PermissionError:
-            print_colored("Permission denied when trying to update /etc/hosts.", "red")
-            print_colored("Please run the script as root or manually update /etc/hosts.", "yellow")
+            print_colored("Permission denied when trying to update /etc/hosts.", "yellow")
+            use_sudo = get_user_input("Do you want to try updating /etc/hosts using sudo? (yes/no): ", ["yes", "no"]).lower() == "yes"
+            if use_sudo:
+                sudo_command = f"echo '{hosts_entry}' | sudo tee -a /etc/hosts"
+                success, _, error = run_command(sudo_command)
+                if success:
+                    print_colored("Successfully updated /etc/hosts using sudo.", "green")
+                else:
+                    print_colored("Failed to update /etc/hosts even with sudo.", "red")
+                    print_colored(f"Error: {error}", "red")
+                    print_colored("Please manually add the following entry to your /etc/hosts file:", "yellow")
+                    print_colored(hosts_entry, "green")
+            else:
+                print_colored("Please manually add the following entry to your /etc/hosts file.", "yellow")
+                print_colored(hosts_entry, "green")
+        except Exception as e:
+            print_colored(f"An unexpected error occurred: {str(e)}", "red")
+            print_colored("Please manually add the following entry to your /etc/hosts file.", "yellow")
+            print_colored(hosts_entry, "green")
     else:
-        print_colored("Please manually add the entry to your /etc/hosts file.", "yellow")
+        print_colored("Please manually add the following entry to your /etc/hosts file.", "yellow")
+        print_colored(hosts_entry, "green")
 
 def main():
     parser = argparse.ArgumentParser(description="Hopsworks Installation Script")
@@ -399,6 +444,8 @@ def main():
         namespace = get_user_input("Enter the namespace for Hopsworks installation (default: hopsworks):") or "hopsworks"
         installation_id = "unknown"
 
+    print_colored("\nProceeding to setup ingress for Hopsworks...", "blue")
+
     # Check and install ingress controller if necessary
     if not check_ingress_controller():
         if not install_ingress_controller():
@@ -413,6 +460,7 @@ def main():
     hopsworks_url = get_hopsworks_url(namespace)
     if not hopsworks_url:
         print_colored("Unable to determine Hopsworks URL. Please check your ingress configuration.", "yellow")
+        sys.exit(1)
     else:
         ingress_host = hopsworks_url.replace("https://", "")
         update_hosts_file(ingress_address, ingress_host)
@@ -420,7 +468,7 @@ def main():
         if not wait_for_ingress(namespace, hopsworks_url):
             print_colored("Warning: Ingress might not be fully set up. Check your cluster's networking.", "yellow")
         else:
-            print_colored(f"Hopsworks UI should be accessible at: {hopsworks_url}", "cyan")
+            print_colored(f"Hopsworks UI should be accessible at: {hopsworks_url}, logins=admin@hopsworks.ai, password=admin", "cyan")
 
     print_colored("\nInstallation completed!", "green")
     print_colored(f"Your installation ID is: {installation_id}", "green")
