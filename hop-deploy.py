@@ -109,6 +109,15 @@ class HopsworksInstaller:
         self.setup_ingress()
         self.finalize_installation()
 
+    def verify_kubeconfig(self):
+        cmd = "kubectl get nodes"
+        success, output, _ = run_command(cmd, verbose=False)
+        if not success:
+            print_colored("Failed to verify kubeconfig. Unable to get nodes.", "red")
+            return False
+        print_colored("Kubeconfig verified successfully.", "green")
+        return True
+
     def check_pod_status(self):
         cmd = f"kubectl get pods -n {self.namespace}"
         run_command(cmd, verbose=True)
