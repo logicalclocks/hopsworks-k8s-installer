@@ -146,6 +146,10 @@ class HopsworksInstaller:
     def setup_kubeconfig(self):
         print_colored(f"\nSetting up kubeconfig for {self.environment}...", "blue")
 
+        kubeconfig_path = None
+        cluster_name = None
+        region = None
+
         if self.environment == "OVH":
             kubeconfig_path = input("Enter the full path to your OVH kubeconfig file: ").strip()
             kubeconfig_path = os.path.expanduser(kubeconfig_path)
@@ -174,32 +178,14 @@ class HopsworksInstaller:
                 return None, None, None
             os.environ['KUBECONFIG'] = kubeconfig_path
 
+        if kubeconfig_path:
+            os.environ['KUBECONFIG'] = kubeconfig_path
+            with open('set_kubeconfig.sh', 'w') as f:
+                f.write(f"export KUBECONFIG={kubeconfig_path}\n")
+            print("\nTo use kubectl in your current shell, run:")
+            print("source set_kubeconfig.sh")
+
         return kubeconfig_path, cluster_name if self.environment == "AWS" else None, region if self.environment == "AWS" else None
-
-    def verify_kubeconfig(self):
-        print_colored("Verifying kubeconfig and cluster connection...", "blue")
-
-        # Check if we can view the config
-        if not run_command("kubectl config view --raw", verbose=False)[0]:
-            print_colored("Failed to read the kubeconfig. Check if the file is valid.", "red")
-            return False
-
-        # Check if we can list nodes
-        if not run_command("kubectl get nodes", verbose=False)[0]:
-            print_colored("Failed to connect to the cluster. Check your VPN connection and cluster status.", "red")
-            return False
-
-        # Get current context
-        _, current_context, _ = run_command("kubectl config current-context", verbose=False)
-        current_context = current_context.strip()
-
-        print_colored(f"Current context: {current_context}", "cyan")
-        if get_user_input("Is this the correct context? (yes/no):", ["yes", "no"]).lower() != "yes":
-            self.prune_contexts()
-            return False
-
-        print_colored(f"Successfully connected to the {self.environment} cluster.", "green")
-        return True
 
     def prune_contexts(self):
         print_colored("Available contexts:", "blue")
@@ -514,29 +500,37 @@ def install_hopsworks(namespace, environment):
         return False
 
     print_colored("\nHopsworks installation command completed.", "green")
-    print_colored("Waiting for Hopsworks pods to be ready...", "yellow")
+    print_colored("Checking Hopsworks pod readiness...", "yellow")
     return wait_for_pods_ready(namespace)
 
-def wait_for_pods_ready(namespace, timeout=1800):
-    print_colored("Waiting for all pods to be ready...", "yellow")
+def wait_for_pods_ready(namespace, timeout=600):  # 10 minutes timeout
+    print_colored("Checking pod readiness...", "yellow")
     start_time = time.time()
+    
     while time.time() - start_time < timeout:
         cmd = f"kubectl get pods -n {namespace} -o json"
         success, output, _ = run_command(cmd, verbose=False)
+        
         if success:
             pods = json.loads(output)['items']
-            ready_pods = [pod for pod in pods if all(
+            total_pods = len(pods)
+            ready_pods = sum(1 for pod in pods if all(
                 cont.get('ready', False) for cont in pod['status'].get('containerStatuses', [])
-            )]
-            if len(ready_pods) == len(pods):
-                print_colored("\nAll pods are ready!", "green")
+            ))
+            
+            print_colored(f"\rPods ready: {ready_pods}/{total_pods}", "cyan", end='')
+            
+            if ready_pods == total_pods:
+                print_colored(f"\nAll {total_pods} pods are ready!", "green")
                 return True
+            
+            # If most pods are ready, reduce the wait time
+            time.sleep(5 if ready_pods / total_pods > 0.9 else 10)
+        else:
+            print_colored("\nFailed to get pod status. Retrying...", "yellow")
+            time.sleep(5)
 
-        elapsed = int(time.time() - start_time)
-        simple_progress(elapsed, timeout)
-        time.sleep(10)
-
-    print_colored("\nTimed out waiting for pods to be ready.", "red")
+    print_colored("\nTimed out waiting for all pods to be ready.", "red")
     return False
 
 def wait_for_ingress_address(namespace, timeout=600):
