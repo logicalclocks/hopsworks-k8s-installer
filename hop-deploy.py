@@ -87,27 +87,15 @@ class HopsworksInstaller:
             self.setup_environment_specifics()
             if self.install_hopsworks():
                 print_colored("\nHopsworks installation completed.", "green")
-                print_colored("It's recommended to wait until most pods are running before setting up ingress.", "yellow")
-                while True:
-                    choice = get_user_input(
-                        "Enter 'i' to setup ingress now, 'c' to check pod status, or 'q' to quit:",
-                        ["i", "c", "q"]
-                    )
-                    if choice.lower() == "i":
-                        break
-                    elif choice.lower() == "c":
-                        self.check_pod_status()
-                    elif choice.lower() == "q":
-                        print_colored(
-                            "Exiting without setting up ingress. You can run the script with --ingress-only later.",
-                            "yellow"
-                        )
-                        return
-                    else:
-                        print_colored("Invalid option. Please try again.", "yellow")
-
-        self.setup_ingress()
-        self.finalize_installation()
+                print_colored("Proceeding to setup ingress for Hopsworks...", "blue")
+                self.setup_ingress()
+                self.finalize_installation()
+            else:
+                print_colored("Hopsworks installation failed. Please check the logs and try again.", "red")
+                sys.exit(1)
+        else:
+            self.setup_ingress()
+            self.finalize_installation()
 
     def verify_kubeconfig(self):
         cmd = "kubectl get nodes"
@@ -196,24 +184,6 @@ class HopsworksInstaller:
 
         return kubeconfig_path, cluster_name if self.environment == "AWS" else None, region if self.environment == "AWS" else None
 
-    def prune_contexts(self):
-        print_colored("Available contexts:", "blue")
-        _, contexts, _ = run_command("kubectl config get-contexts -o name", verbose=False)
-        contexts = contexts.strip().split('\n')
-        for i, context in enumerate(contexts, 1):
-            print(f"{i}. {context}")
-
-        choice = get_user_input(
-            "Enter the number of the context you want to use, or 'q' to quit:",
-            [str(i) for i in range(1, len(contexts) + 1)] + ['q']
-        )
-        if choice.lower() == 'q':
-            sys.exit(1)
-
-        selected_context = contexts[int(choice) - 1]
-        run_command(f"kubectl config use-context {selected_context}")
-        print_colored(f"Switched to context: {selected_context}", "green")
-
     def get_aws_region(self):
         region = os.environ.get('AWS_REGION')
         if not region:
@@ -244,10 +214,62 @@ class HopsworksInstaller:
                 print_colored("Failed to set up AWS Load Balancer Controller. Installation may fail.", "red")
 
     def install_hopsworks(self):
-        if not install_hopsworks(self.namespace, self.environment):
-            print_colored("Hopsworks installation failed. Please check the logs and try again.", "red")
-            sys.exit(1)
-        return True
+        print_colored("\nInstalling Hopsworks...", "blue")
+
+        if not run_command("helm repo add hopsworks https://nexus.hops.works/repository/hopsworks-helm --force-update")[0]:
+            print_colored("Failed to add Hopsworks Helm repo.", "red")
+            return False
+
+        print_colored("Updating Helm repositories...", "cyan")
+        if not run_command("helm repo update")[0]:
+            print_colored("Failed to update Helm repos.", "red")
+            return False
+
+        if os.path.exists('hopsworks'):
+            shutil.rmtree('hopsworks', ignore_errors=True)
+
+        print_colored("Pulling Hopsworks Helm chart...", "cyan")
+        if not run_command("helm pull hopsworks/hopsworks --untar --devel")[0]:
+            print_colored("Failed to pull Hopsworks chart.", "red")
+            return False
+
+        env_config = ENV_CONFIGS.get(self.environment, {})
+        ingress_class = env_config.get('ingress_class', 'nginx')
+        ingress_annotations = json.dumps(env_config.get('annotations', {}))
+
+        helm_command = (
+            f"helm upgrade --install hopsworks-release hopsworks/hopsworks "
+            f"--namespace={self.namespace} "
+            f"--create-namespace "
+            f"--values hopsworks/values.yaml "
+            f"--set externalLoadBalancers.enabled=true "
+            f"--set ingress.enabled=true "
+            f"--set ingress.ingressClassName={ingress_class} "
+            f"--set-json ingress.annotations='{ingress_annotations}' "
+            f"--timeout 60m "
+            f"--wait "
+            f"--debug "
+            f"--devel"
+        )
+
+        print_colored("Starting Hopsworks installation...", "cyan")
+
+        stop_event = threading.Event()
+        status_thread = threading.Thread(target=periodic_status_update, args=(stop_event, self.namespace))
+        status_thread.start()
+
+        success, _, _ = run_command(helm_command)
+
+        stop_event.set()
+        status_thread.join()
+
+        if not success:
+            print_colored("\nHopsworks installation command failed.", "red")
+            return False
+
+        print_colored("\nHopsworks installation command completed.", "green")
+        print_colored("Checking Hopsworks pod readiness...", "yellow")
+        return wait_for_pods_ready(self.namespace)
 
     def setup_ingress(self):
         print_colored("\nProceeding to setup ingress for Hopsworks...", "blue")
@@ -310,11 +332,6 @@ def run_command(command, verbose=False):
         return result.returncode == 0, result.stdout, result.stderr
     except Exception as e:
         return False, "", str(e)
-
-def simple_progress(current, total):
-    percent = int(current / total * 100)
-    bar = '=' * percent + '-' * (100 - percent)
-    print(f'\r[{bar}] {percent}%', end='')
 
 def get_user_input(prompt, options=None):
     while True:
@@ -454,67 +471,11 @@ def setup_ingress(environment, namespace, cluster_name=None, region=None):
             return run_command(setup_cmd)[0]
     return True
 
-def install_hopsworks(namespace, environment):
-    print_colored("\nInstalling Hopsworks...", "blue")
-
-    if not run_command("helm repo add hopsworks https://nexus.hops.works/repository/hopsworks-helm --force-update")[0]:
-        print_colored("Failed to add Hopsworks Helm repo.", "red")
-        return False
-
-    print_colored("Updating Helm repositories...", "cyan")
-    if not run_command("helm repo update")[0]:
-        print_colored("Failed to update Helm repos.", "red")
-        return False
-
-    if os.path.exists('hopsworks'):
-        shutil.rmtree('hopsworks', ignore_errors=True)
-
-    print_colored("Pulling Hopsworks Helm chart...", "cyan")
-    if not run_command("helm pull hopsworks/hopsworks --untar --devel")[0]:
-        print_colored("Failed to pull Hopsworks chart.", "red")
-        return False
-
-    env_config = ENV_CONFIGS.get(environment, {})
-    ingress_class = env_config.get('ingress_class', 'nginx')  # Default to nginx if not specified
-    ingress_annotations = json.dumps(env_config.get('annotations', {}))
-
-    helm_command = (
-        f"helm upgrade --install hopsworks-release hopsworks/hopsworks "
-        f"--namespace={namespace} "
-        f"--create-namespace "
-        f"--values hopsworks/values.yaml "
-        f"--set externalLoadBalancers.enabled=true "
-        f"--set ingress.enabled=true "
-        f"--set ingress.ingressClassName={ingress_class} "
-        f"--set-json ingress.annotations='{ingress_annotations}' "
-        f"--timeout 60m "
-        f"--wait "
-        f"--debug "
-        f"--devel"
-    )
-
-    print_colored("Starting Hopsworks installation...", "cyan")
-
-    stop_event = threading.Event()
-    status_thread = threading.Thread(target=periodic_status_update, args=(stop_event, namespace))
-    status_thread.start()
-
-    success, _, _ = run_command(helm_command)
-
-    stop_event.set()
-    status_thread.join()
-
-    if not success:
-        print_colored("\nHopsworks installation command failed.", "red")
-        return False
-
-    print_colored("\nHopsworks installation command completed.", "green")
-    print_colored("Checking Hopsworks pod readiness...", "yellow")
-    return wait_for_pods_ready(namespace)
-
-def wait_for_pods_ready(namespace, timeout=600):  # 10 minutes timeout
+def wait_for_pods_ready(namespace, timeout=600, readiness_threshold=0.7):
     print_colored("Checking pod readiness...", "yellow")
     start_time = time.time()
+    
+    critical_pods = ['namenode', 'resourcemanager', 'hopsworks', 'mysql']
     
     while time.time() - start_time < timeout:
         cmd = f"kubectl get pods -n {namespace} -o json"
@@ -523,23 +484,34 @@ def wait_for_pods_ready(namespace, timeout=600):  # 10 minutes timeout
         if success:
             pods = json.loads(output)['items']
             total_pods = len(pods)
-            ready_pods = sum(1 for pod in pods if all(
-                cont.get('ready', False) for cont in pod['status'].get('containerStatuses', [])
-            ))
+            ready_pods = 0
+            critical_ready = 0
             
-            print_colored(f"\rPods ready: {ready_pods}/{total_pods}", "cyan", end='')
+            for pod in pods:
+                if all(cont.get('ready', False) for cont in pod['status'].get('containerStatuses', [])):
+                    ready_pods += 1
+                    if any(critical in pod['metadata']['name'] for critical in critical_pods):
+                        critical_ready += 1
             
-            if ready_pods == total_pods:
-                print_colored(f"\nAll {total_pods} pods are ready!", "green")
+            readiness_ratio = ready_pods / total_pods
+            print_colored(f"\rPods ready: {ready_pods}/{total_pods} ({readiness_ratio:.2%})", "cyan", end='')
+            
+            if readiness_ratio >= readiness_threshold and critical_ready == len(critical_pods):
+                print_colored(f"\nSufficient pods are ready! ({readiness_ratio:.2%})", "green")
                 return True
             
-            # If most pods are ready, reduce the wait time
-            time.sleep(5 if ready_pods / total_pods > 0.9 else 10)
+            time.sleep(5)
         else:
             print_colored("\nFailed to get pod status. Retrying...", "yellow")
             time.sleep(5)
+        
+        if time.time() - start_time > 300:  # 5 minutes passed
+            proceed = get_user_input("\nTaking longer than expected. Do you want to proceed anyway? (yes/no): ", ["yes", "no"])
+            if proceed.lower() == "yes":
+                print_colored("Proceeding with installation...", "yellow")
+                return True
 
-    print_colored("\nTimed out waiting for all pods to be ready.", "red")
+    print_colored("\nTimed out waiting for pods to be ready.", "red")
     return False
 
 def wait_for_ingress_address(namespace, timeout=600):
