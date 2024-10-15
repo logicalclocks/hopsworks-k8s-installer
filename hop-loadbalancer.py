@@ -219,7 +219,7 @@ class HopsworksInstaller:
         else:
             print_colored(f"Hopsworks LoadBalancer address: {load_balancer_address}", "green")
 
-        hopsworks_url = f"https://{load_balancer_address}"
+        hopsworks_url = f"https://{load_balancer_address}:28181"  # Note the added port
         print_colored(f"Hopsworks UI should be accessible at: {hopsworks_url}", "cyan")
         print_colored("Default login: admin@hopsworks.ai, password: admin", "cyan")
 
@@ -244,13 +244,28 @@ class HopsworksInstaller:
         )
 
     def get_load_balancer_address(self):
-        cmd = f"kubectl get svc -n {self.namespace} -o jsonpath='{{.items[?(@.spec.type==\"LoadBalancer\")].status.loadBalancer.ingress[0].ip}}{{.items[?(@.spec.type==\"LoadBalancer\")].status.loadBalancer.ingress[0].hostname}}'"
+        cmd = f"kubectl get svc -n {self.namespace} hopsworks-release -o jsonpath='{{.status.loadBalancer.ingress[0].ip}}'"
         success, output, _ = run_command(cmd, verbose=False)
         if success and output.strip():
             return output.strip()
         else:
-            print_colored("Failed to retrieve LoadBalancer address. Please check your service configuration.", "yellow")
-            return None
+            print_colored("Failed to retrieve LoadBalancer address for hopsworks-release. Checking alternatives...", "yellow")
+            
+            # Fallback to checking all LoadBalancer services
+            cmd = f"kubectl get svc -n {self.namespace} -o jsonpath='{{range .items}}{{if eq .spec.type \"LoadBalancer\"}}{{.metadata.name}}{{\"=\"}}{{.status.loadBalancer.ingress[0].ip}}{{\"\\n\"}}{{end}}{{end}}'"
+            success, output, _ = run_command(cmd, verbose=False)
+            if success and output.strip():
+                services = dict(line.split('=') for line in output.strip().split('\n'))
+                if 'hopsworks-release' in services:
+                    return services['hopsworks-release']
+                else:
+                    print_colored("Couldn't find hopsworks-release LoadBalancer. Available LoadBalancer services:", "yellow")
+                    for svc, ip in services.items():
+                        print(f"{svc}: {ip}")
+                    return None
+            else:
+                print_colored("Failed to retrieve any LoadBalancer addresses. Please check your service configuration.", "yellow")
+                return None
 
 def print_colored(message, color, **kwargs):
     colors = {
