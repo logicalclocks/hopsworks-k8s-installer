@@ -1,3 +1,4 @@
 hopsworks
 hopsworks-ingress.yaml
 policy
+set_kubeconfig.sh
