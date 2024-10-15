@@ -300,11 +300,19 @@ def get_user_input(prompt, options=None):
 def periodic_status_update(stop_event, namespace):
     while not stop_event.is_set():
         cmd = f"kubectl get pods -n {namespace} --no-headers"
-        success, output, _ = run_command(cmd, verbose=False)
-        if success:
+        success, output, error = run_command(cmd, verbose=False)
+        if success and output.strip():
             pod_count = len(output.strip().split('\n'))
             print_colored(f"\rCurrent status: {pod_count} pods created", "cyan", end='')
+        else:
+            if "No resources found" in error:
+                print_colored("\rWaiting for pods to be created...", "yellow", end='')
+            else:
+                print_colored(f"\rError checking pod status: {error.strip()}", "red", end='')
+        sys.stdout.flush()  # Ensure the output is displayed immediately
         time.sleep(10)  # Update every 10 seconds
+    print()  # Print a newline when done to move to the next line
+
 
 def get_license_agreement():
     print_colored("\nChoose a license agreement:", "blue")
@@ -391,8 +399,8 @@ def wait_for_pods_ready(namespace, timeout=600, readiness_threshold=0.7):
             print_colored("\nFailed to get pod status. Retrying...", "yellow")
             time.sleep(5)
         
-        if time.time() - start_time > 300:  # 5 minutes passed
-            proceed = get_user_input("\nTaking longer than expected. Do you want to proceed anyway? (yes/no): ", ["yes", "no"])
+        if time.time() - start_time > 30:  # 5 minutes passed
+            proceed = get_user_input("\nMost of the pods are ready! Proceed? (yes/no): ", ["yes", "no"])
             if proceed.lower() == "yes":
                 print_colored("Proceeding with installation...", "yellow")
                 return True
