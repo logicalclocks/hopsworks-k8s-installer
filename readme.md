@@ -1,6 +1,6 @@
 # Hopsworks Installer
 
-This script automates the installation of Hopsworks on Kubernetes clusters, with specific optimizations for AWS EKS.
+This script automates the installation of Hopsworks on Kubernetes clusters, with specific optimizations for each cloud providers.
 
 ## Prerequisites
 
