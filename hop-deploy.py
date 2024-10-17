@@ -15,6 +15,8 @@ import ssl
 import threading
 
 from util import (
+    get_deployment_environment,
+    get_user_input,
     print_colored,
     periodic_status_update,
     run_command
@@ -316,24 +318,6 @@ class HopsworksInstaller:
             "blue"
         )
 
-
-def get_user_input(prompt, options=None):
-    while True:
-        response = input(prompt + " ").strip()
-        if options is None or response.lower() in [option.lower() for option in options]:
-            return response
-        print_colored(f"Invalid input. Expected one of: {', '.join(options)}", "yellow")
-
-def get_deployment_environment():
-    environments = list(ENV_CONFIGS.keys()) + ["On-Premise/VM"]
-    print_colored("Select your deployment environment:", "blue")
-    for i, env in enumerate(environments, 1):
-        print(f"{i}. {env}")
-    choice = get_user_input(
-        "Enter the number of your environment:",
-        [str(i) for i in range(1, len(environments) + 1)]
-    )
-    return environments[int(choice) - 1]
 
 def get_license_agreement():
     print_colored("\nChoose a license agreement:", "blue")
