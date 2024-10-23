@@ -31,28 +31,15 @@ EVALUATION_LICENSE_URL = "https://www.hopsworks.ai/evaluation-license"
 eks_helm_addition = {
     "global._hopsworks.cloudProvider": "AWS",
     "global._hopsworks.imagePullPolicy": "Always",  
-    "docker-registry.enabled": "true",
-    "docker-registry.replicas": "1",
-    "hopsfs.datanode.count": "1",
     "hopsworks.replicaCount.worker": "1",
-    "hopsworks.payara.debug": "true",
-    "rondb.isMultiNodeCluster": "true",
     "rondb.clusterSize.activeDataReplicas": "1",
     "hopsworks.service.worker.external.https.type": "LoadBalancer",
-    # "hopsworks.service.worker.external.https.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-ssl-cert": "<your-acm-cert-arn>",
-    # "hopsworks.service.worker.external.https.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-backend-protocol": "https",
-    # "hopsworks.service.worker.external.https.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-ssl-ports": "443,8181",
 }
 
 aks_helm_addition = {
     "global._hopsworks.cloudProvider": "AZURE",
-    "global._hopsworks.imagePullPolicy": "Always",  
-    "docker-registry.enabled": "true",
-    "docker-registry.replicas": "1",
-    "hopsfs.datanode.count": "1",
+    "global._hopsworks.imagePullPolicy": "Always",      
     "hopsworks.replicaCount.worker": "1",
-    "hopsworks.payara.debug": "true",
-    "rondb.isMultiNodeCluster": "true",
     "rondb.clusterSize.activeDataReplicas": "1",
     "hopsworks.service.worker.external.https.type": "LoadBalancer",
  }
@@ -315,12 +302,12 @@ class HopsworksInstaller:
         
         if self.use_managed_registry:
             helm_command += (
-                f" --set global._hopsworks.managedDockerRegistry.enabled=true"
-                f" --set global._hopsworks.managedDockerRegistry.domain={self.managed_registry_info['domain']}"
-                f" --set global._hopsworks.managedDockerRegistry.namespace={self.managed_registry_info['namespace']}"
+                f" --set global._hopsworks.managedDockerRegistery.enabled=true"
+                f" --set global._hopsworks.managedDockerRegistery.domain={self.managed_registry_info['domain']}"
+                f" --set global._hopsworks.managedDockerRegistery.namespace={self.managed_registry_info['namespace']}"
             )
             if self.environment == "AWS":
-                helm_command += f" --set global._hopsworks.managedDockerRegistry.credHelper.enabled=true"
+                helm_command += f" --set global._hopsworks.managedDockerRegistery.credHelper.enabled=true"
 
         helm_command += " --timeout 60m --wait --devel"
 
