@@ -215,18 +215,19 @@ class HopsworksInstaller:
                 
     def setup_aws_ecr(self):
         client = boto3.client('ecr', region_name=self.region)
-        repo_name = f"hopsworks-{self.cluster_name}/hopsworks-base" 
+        base_repo_name = f"hopsworks-{self.cluster_name}/hopsworks-base"
         try:
-            response = client.create_repository(repositoryName=repo_name)
+            response = client.create_repository(repositoryName=base_repo_name)
             repo_uri = response['repository']['repositoryUri']
         except client.exceptions.RepositoryAlreadyExistsException:
-            repo_uri = client.describe_repositories(repositoryNames=[repo_name])['repositories'][0]['repositoryUri']
+            repo_uri = client.describe_repositories(repositoryNames=[base_repo_name])['repositories'][0]['repositoryUri']
         
         self.managed_registry_info = {
             "domain": repo_uri.split('/')[0],
-            "namespace": repo_name
+            "namespace": f"hopsworks-{self.cluster_name}"  # Just the base name without /hopsworks-base
         }
         print_colored(f"ECR repository set up: {repo_uri}", "green")
+
    
     def setup_azure_acr(self):
         cmd = f"az acr list --resource-group {self.resource_group} --query \"[0].name\" -o tsv"
