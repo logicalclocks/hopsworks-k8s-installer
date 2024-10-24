@@ -34,6 +34,12 @@ eks_helm_addition = {
     "hopsworks.replicaCount.worker": "1",
     "rondb.clusterSize.activeDataReplicas": "1",
     "hopsworks.service.worker.external.https.type": "LoadBalancer",
+    "global._hopsworks.managedDockerRegistery.credHelper.secretName": "awsregcred",
+    "hopsworks.variables.docker_operations_managed_docker_secrets": "awsregcred",
+    "hopsworks.variables.docker_operations_image_pull_secrets": "awsregcred",
+    "hopsworks.dockerRegistry.preset.secrets[0]": "awsregcred",
+    "hopsfs.datanode.count": "2"
+
 }
 
 aks_helm_addition = {
@@ -42,6 +48,8 @@ aks_helm_addition = {
     "hopsworks.replicaCount.worker": "1",
     "rondb.clusterSize.activeDataReplicas": "1",
     "hopsworks.service.worker.external.https.type": "LoadBalancer",
+    "hopsfs.datanode.count": "2"
+
  }
 
 class HopsworksInstaller:
@@ -207,7 +215,7 @@ class HopsworksInstaller:
                 
     def setup_aws_ecr(self):
         client = boto3.client('ecr', region_name=self.region)
-        repo_name = f"hopsworks-{self.cluster_name}"
+        repo_name = f"hopsworks-{self.cluster_name}/hopsworks-base" 
         try:
             response = client.create_repository(repositoryName=repo_name)
             repo_uri = response['repository']['repositoryUri']
@@ -290,6 +298,7 @@ class HopsworksInstaller:
             f"--namespace={self.namespace} "
             f"--create-namespace "
             f"--values hopsworks/values.yaml "
+            # f"--set hopsfs.datanode.count=2"
             f"--set hopsworks.service.worker.external.https.type=LoadBalancer "
         )
         
