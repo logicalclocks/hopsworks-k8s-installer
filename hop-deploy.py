@@ -13,6 +13,7 @@ import urllib.request
 import urllib.error
 import ssl
 import threading
+import boto3
 
 HOPSWORKS_LOGO = """
 ██╗  ██╗    ██████╗    ██████╗    ███████╗   ██╗    ██╗    ██████╗    ██████╗    ██╗  ██╗   ███████╗
@@ -27,42 +28,35 @@ SERVER_URL = "https://magiclex--hopsworks-installation-hopsworks-installation.mo
 STARTUP_LICENSE_URL = "https://www.hopsworks.ai/startup-license"
 EVALUATION_LICENSE_URL = "https://www.hopsworks.ai/evaluation-license"
 
-ENV_CONFIGS = {
-    "AWS": {
-        "ingress_class": "alb",
-        "annotations": {
-            "alb.ingress.kubernetes.io/scheme": "internet-facing",
-            "service.beta.kubernetes.io/aws-load-balancer-scheme": "internet-facing"
-        },
-        "setup_cmd": None  # AWS uses the AWS Load Balancer Controller
-    },
-    "GCP": {
-        "ingress_class": "gce",
-        "annotations": {"kubernetes.io/ingress.class": "gce"},
-        "setup_cmd": (
-            "helm install ingress-nginx ingress-nginx/ingress-nginx "
-            "--namespace ingress-nginx --create-namespace "
-            "--set controller.service.type=LoadBalancer"
-        )
-    },
-    "OVH": {
-        "ingress_class": "nginx",
-        "annotations": {},
-        "setup_cmd": (
-            "helm install ingress-nginx ingress-nginx/ingress-nginx "
-            "--namespace ingress-nginx --create-namespace "
-            "--set controller.service.type=LoadBalancer"
-        )
-    },
-    "Azure": {
-        "ingress_class": "nginx",
-        "annotations": {},
-        "setup_cmd": (
-            "helm install ingress-nginx ingress-nginx/ingress-nginx "
-            "--namespace ingress-nginx --create-namespace "
-            "--set controller.service.type=LoadBalancer"
-        )
-    },
+eks_helm_addition = {
+    "global._hopsworks.cloudProvider": "AWS",
+    "global._hopsworks.imagePullPolicy": "Always",  
+    "hopsworks.replicaCount.worker": "1",
+    "rondb.clusterSize.activeDataReplicas": "1",
+    "hopsworks.service.worker.external.https.type": "LoadBalancer",
+    "global._hopsworks.managedDockerRegistery.credHelper.secretName": "awsregcred",
+    "hopsworks.variables.docker_operations_managed_docker_secrets": "awsregcred",
+    "hopsworks.variables.docker_operations_image_pull_secrets": "awsregcred",
+    "hopsworks.dockerRegistry.preset.secrets[0]": "awsregcred",
+    "hopsfs.datanode.count": "2"
+}
+
+aks_helm_addition = {
+    "global._hopsworks.cloudProvider": "AZURE",
+    "global._hopsworks.imagePullPolicy": "Always",      
+    "hopsworks.replicaCount.worker": "1",
+    "rondb.clusterSize.activeDataReplicas": "1",
+    "hopsworks.service.worker.external.https.type": "LoadBalancer",
+    "hopsfs.datanode.count": "2"
+}
+
+gke_helm_addition = {
+    "global._hopsworks.cloudProvider": "GCP",
+    "global._hopsworks.imagePullPolicy": "Always",      
+    "hopsworks.replicaCount.worker": "1",
+    "rondb.clusterSize.activeDataReplicas": "1",
+    "hopsworks.service.worker.external.https.type": "LoadBalancer",
+    "hopsfs.datanode.count": "2"
 }
 
 class HopsworksInstaller:
@@ -74,6 +68,8 @@ class HopsworksInstaller:
         self.namespace = 'hopsworks'
         self.installation_id = None
         self.args = None
+        self.use_managed_registry = False
+        self.managed_registry_info = None
 
     def run(self):
         print_colored(HOPSWORKS_LOGO, "white")
@@ -81,53 +77,18 @@ class HopsworksInstaller:
         self.parse_arguments()
         self.get_deployment_environment()
         self.setup_and_verify_kubeconfig()
+        self.handle_managed_registry()
 
-        if not self.args.ingress_only:
+        if not self.args.loadbalancer_only:
             self.handle_license_and_user_data()
-            self.setup_environment_specifics()
             if self.install_hopsworks():
                 print_colored("\nHopsworks installation completed.", "green")
-                print_colored("Proceeding to setup ingress for Hopsworks...", "blue")
-                self.setup_ingress()
                 self.finalize_installation()
             else:
                 print_colored("Hopsworks installation failed. Please check the logs and try again.", "red")
                 sys.exit(1)
         else:
-            self.setup_ingress()
             self.finalize_installation()
-
-    def verify_kubeconfig(self):
-        cmd = "kubectl get nodes"
-        success, output, _ = run_command(cmd, verbose=False)
-        if not success:
-            print_colored("Failed to verify kubeconfig. Unable to get nodes.", "red")
-            return False
-        print_colored("Kubeconfig verified successfully.", "green")
-        return True
-
-    def check_pod_status(self):
-        cmd = f"kubectl get pods -n {self.namespace}"
-        run_command(cmd, verbose=True)
-
-    def check_required_tools(self):
-        tools = ["kubectl", "helm"]
-        for tool in tools:
-            if not shutil.which(tool):
-                print_colored(f"{tool} not found. Please install it and try again.", "red")
-                sys.exit(1)
-
-    def parse_arguments(self):
-        parser = argparse.ArgumentParser(description="Hopsworks Installation Script")
-        parser.add_argument('--ingress-only', action='store_true', help='Jump directly to the ingress setup')
-        parser.add_argument('--no-user-data', action='store_true', help='Skip sending user data')
-        parser.add_argument('--skip-license', action='store_true', help='Skip license agreement step')
-        parser.add_argument('--namespace', default='hopsworks', help='Namespace for Hopsworks installation')
-        self.args = parser.parse_args()
-        self.namespace = self.args.namespace
-
-    def get_deployment_environment(self):
-        self.environment = get_deployment_environment()
 
     def setup_and_verify_kubeconfig(self):
         while True:
@@ -147,33 +108,46 @@ class HopsworksInstaller:
         cluster_name = None
         region = None
 
-        if self.environment == "OVH":
-            kubeconfig_path = input("Enter the full path to your OVH kubeconfig file: ").strip()
-            kubeconfig_path = os.path.expanduser(kubeconfig_path)
-            if not os.path.exists(kubeconfig_path):
-                print_colored(f"The file {kubeconfig_path} does not exist. Check the path and try again.", "red")
-                return None, None, None
-            os.environ['KUBECONFIG'] = kubeconfig_path
-
-        elif self.environment == "AWS":
+        if self.environment == "AWS":
+            # Keep existing AWS logic
             cluster_name = input("Enter your EKS cluster name: ").strip()
             region = self.get_aws_region()
             cmd = f"aws eks get-token --cluster-name {cluster_name} --region {region}"
             if not run_command(cmd)[0]:
-                print_colored("Failed to get EKS token. Trying to update kubeconfig directly...", "yellow")
+                print_colored("Failed to get EKS token. Updating kubeconfig...", "yellow")
                 cmd = f"aws eks update-kubeconfig --name {cluster_name} --region {region}"
                 if not run_command(cmd)[0]:
                     print_colored("Failed to update kubeconfig.", "red")
                     return None, None, None
             kubeconfig_path = os.path.expanduser("~/.kube/config")
+            
+        elif self.environment =="GCP":
+            cluster_name = input("Enter your GKE cluster name: ").strip()
+            project_id = input("Enter your GCP project ID: ").strip()
+            region = input("Enter your GCP region: ").strip()
+            cmd = f"gcloud container clusters get-credentials {cluster_name} --project {project_id} --region {region}"
+        if not run_command(cmd)[0]:
+            print_colored("Failed to get GKE credentials. Check your gcloud setup.", "red")
+            return None, None, None
+            run_command("gcloud auth configure-docker", verbose=False)
+            kubeconfig_path = os.path.expanduser("~/.kube/config")
 
-        else:  # For GCP, Azure, On-Premise/VM
+        elif self.environment == "Azure":
+            self.resource_group = input("Enter your Azure resource group name: ").strip()
+            cluster_name = input("Enter your AKS cluster name: ").strip()
+            cmd = f"az aks get-credentials --resource-group {self.resource_group} --name {cluster_name} --overwrite-existing"
+            if not run_command(cmd)[0]:
+                print_colored("Failed to get AKS credentials. Check your Azure CLI configuration and permissions.", "red")
+                return None, None, None
+            kubeconfig_path = os.path.expanduser("~/.kube/config")
+            
+        else:
+            # Keep existing logic for other environments
             kubeconfig_path = input("Enter the path to your kubeconfig file: ").strip()
             kubeconfig_path = os.path.expanduser(kubeconfig_path)
             if not os.path.exists(kubeconfig_path):
                 print_colored(f"The file {kubeconfig_path} does not exist. Check the path and try again.", "red")
                 return None, None, None
-            os.environ['KUBECONFIG'] = kubeconfig_path
 
         if kubeconfig_path:
             os.environ['KUBECONFIG'] = kubeconfig_path
@@ -182,7 +156,64 @@ class HopsworksInstaller:
             print("\nTo use kubectl in your current shell, run:")
             print("source set_kubeconfig.sh")
 
-        return kubeconfig_path, cluster_name if self.environment == "AWS" else None, region if self.environment == "AWS" else None
+        return kubeconfig_path, cluster_name, region
+
+    def verify_kubeconfig(self):
+        print_colored("\nVerifying kubeconfig...", "cyan")
+        
+        # Check current context
+        cmd = "kubectl config current-context"
+        success, output, error = run_command(cmd, verbose=True)
+        if not success:
+            print_colored(f"Failed to get current context. Error: {error}", "red")
+            return False
+        
+        # Try to list namespaces
+        cmd = "kubectl get namespaces"
+        success, output, error = run_command(cmd, verbose=True)
+        if not success:
+            print_colored(f"Failed to list namespaces. Error: {error}", "red")
+            return False
+        
+        print_colored("Kubeconfig verified successfully.", "green")
+        return True
+
+    def check_required_tools(self):
+        tools = ["kubectl", "helm"]
+        for tool in tools:
+            if not shutil.which(tool):
+                print_colored(f"{tool} not found. Please install it and try again.", "red")
+                sys.exit(1)
+
+    def parse_arguments(self):
+        parser = argparse.ArgumentParser(description="Hopsworks Installation Script")
+        parser.add_argument('--loadbalancer-only', action='store_true', help='Jump directly to the LoadBalancer setup')
+        parser.add_argument('--no-user-data', action='store_true', help='Skip sending user data')
+        parser.add_argument('--skip-license', action='store_true', help='Skip license agreement step')
+        parser.add_argument('--namespace', default='hopsworks', help='Namespace for Hopsworks installation')
+        self.args = parser.parse_args()
+        self.namespace = self.args.namespace
+
+    def get_deployment_environment(self):
+        environments = ["AWS", "Azure", "GCP", "OVH", "On-Premise/VM"]
+        print_colored("Select your deployment environment:", "blue")
+        for i, env in enumerate(environments, 1):
+            print(f"{i}. {env}")
+        choice = get_user_input(
+            "Enter the number of your environment:",
+            [str(i) for i in range(1, len(environments) + 1)]
+        )
+        self.environment = environments[int(choice) - 1]
+        
+    def print_current_kubeconfig(self):
+        print_colored("\nCurrent KUBECONFIG environment variable:", "cyan")
+        print(os.environ.get('KUBECONFIG', 'Not set'))
+        
+        print_colored("\nContents of current kubeconfig:", "cyan")
+        cmd = "kubectl config view --raw"
+        success, output, error = run_command(cmd, verbose=True)
+        if not success:
+            print_colored(f"Failed to view kubeconfig. Error: {error}", "red")
 
     def get_aws_region(self):
         region = os.environ.get('AWS_REGION')
@@ -191,6 +222,62 @@ class HopsworksInstaller:
             os.environ['AWS_REGION'] = region
         return region
 
+    def handle_managed_registry(self):
+        if self.environment == "AWS":
+            print_colored("Setting up AWS ECR (required for AWS installations)...", "blue")
+            self.setup_aws_ecr()
+        elif self.environment == "Azure":
+            self.use_managed_registry = get_user_input("Do you want to use a managed registry? (yes/no):", ["yes", "no"]).lower() == "yes"
+            if self.use_managed_registry:
+                self.setup_azure_acr()
+        else:
+            print_colored(f"Managed registry setup for {self.environment} is not implemented yet.", "yellow")
+            self.use_managed_registry = False
+                            
+    def setup_aws_ecr(self):
+        client = boto3.client('ecr', region_name=self.region)
+        base_repo_name = f"hopsworks-{self.cluster_name}/hopsworks-base"
+        try:
+            response = client.create_repository(repositoryName=base_repo_name)
+            repo_uri = response['repository']['repositoryUri']
+        except client.exceptions.RepositoryAlreadyExistsException:
+            repo_uri = client.describe_repositories(repositoryNames=[base_repo_name])['repositories'][0]['repositoryUri']
+        
+        self.managed_registry_info = {
+            "domain": repo_uri.split('/')[0],
+            "namespace": f"hopsworks-{self.cluster_name}"  # Just the base name without /hopsworks-base
+        }
+        print_colored(f"ECR repository set up: {repo_uri}", "green")
+
+
+    def setup_azure_acr(self):
+        cmd = f"az acr list --resource-group {self.resource_group} --query \"[0].name\" -o tsv"
+        success, acr_name, _ = run_command(cmd, verbose=False)
+        if not success or not acr_name:
+            print_colored("No ACR found. Creating a new one...", "yellow")
+            acr_name = f"hopsworks{self.cluster_name.lower()}acr"
+            cmd = f"az acr create --resource-group {self.resource_group} --name {acr_name} --sku Basic"
+            if not run_command(cmd)[0]:
+                print_colored("Failed to create ACR.", "red")
+                return
+        
+        cmd = f"az acr show --name {acr_name} --query loginServer -o tsv"
+        success, acr_login_server, _ = run_command(cmd, verbose=False)
+        if not success:
+            print_colored("Failed to get ACR login server.", "red")
+            return
+        
+        self.managed_registry_info = {
+            "domain": acr_login_server.strip(),
+            "namespace": "hopsworks"
+        }
+        print_colored(f"ACR set up: {acr_login_server}", "green")
+        
+        # Attach ACR to AKS
+        cmd = f"az aks update --name {self.cluster_name} --resource-group {self.resource_group} --attach-acr {acr_name}"
+        if not run_command(cmd)[0]:
+            print_colored("Failed to attach ACR to AKS. You may need to do this manually.", "yellow")
+            
     def handle_license_and_user_data(self):
         if not self.args.skip_license:
             license_type, agreement = get_license_agreement()
@@ -207,11 +294,6 @@ class HopsworksInstaller:
                 self.installation_id = "unknown"
         else:
             self.installation_id = "debug_mode"
-
-    def setup_environment_specifics(self):
-        if self.environment == "AWS":
-            if not create_aws_load_balancer_controller(self.cluster_name, self.region, "kube-system"):
-                print_colored("Failed to set up AWS Load Balancer Controller. Installation may fail.", "red")
 
     def install_hopsworks(self):
         print_colored("\nInstalling Hopsworks...", "blue")
@@ -233,24 +315,35 @@ class HopsworksInstaller:
             print_colored("Failed to pull Hopsworks chart.", "red")
             return False
 
-        env_config = ENV_CONFIGS.get(self.environment, {})
-        ingress_class = env_config.get('ingress_class', 'nginx')
-        ingress_annotations = json.dumps(env_config.get('annotations', {}))
-
         helm_command = (
             f"helm upgrade --install hopsworks-release hopsworks/hopsworks "
             f"--namespace={self.namespace} "
             f"--create-namespace "
             f"--values hopsworks/values.yaml "
-            f"--set externalLoadBalancers.enabled=true "
-            f"--set ingress.enabled=true "
-            f"--set ingress.ingressClassName={ingress_class} "
-            f"--set-json ingress.annotations='{ingress_annotations}' "
-            f"--timeout 60m "
-            f"--wait "
-            f"--debug "
-            f"--devel"
+            # f"--set hopsfs.datanode.count=2"
+            f"--set hopsworks.service.worker.external.https.type=LoadBalancer "
         )
+        
+        if self.environment == "AWS":
+            for key, value in eks_helm_addition.items():
+                helm_command += f" --set {key}={value} "
+        elif self.environment == "Azure":
+            for key, value in aks_helm_addition.items():
+                helm_command += f" --set {key}={value} "
+        elif self.environment == "GCP":
+            for key, value in aks_helm_addition.items():
+                helm_command += f" --set {key}={value} "
+
+        if self.use_managed_registry:
+            helm_command += (
+                f" --set global._hopsworks.managedDockerRegistery.enabled=true"
+                f" --set global._hopsworks.managedDockerRegistery.domain={self.managed_registry_info['domain']}"
+                f" --set global._hopsworks.managedDockerRegistery.namespace={self.managed_registry_info['namespace']}"
+            )
+            if self.environment == "AWS":
+                helm_command += f" --set global._hopsworks.managedDockerRegistery.credHelper.enabled=true"
+
+        helm_command += " --timeout 60m --wait --devel"
 
         print_colored("Starting Hopsworks installation...", "cyan")
 
@@ -271,24 +364,16 @@ class HopsworksInstaller:
         print_colored("Checking Hopsworks pod readiness...", "yellow")
         return wait_for_pods_ready(self.namespace)
 
-    def setup_ingress(self):
-        print_colored("\nProceeding to setup ingress for Hopsworks...", "blue")
-        if not setup_ingress(self.environment, self.namespace, self.cluster_name, self.region):
-            print_colored("Failed to setup ingress. You may need to set it up manually.", "red")
-
     def finalize_installation(self):
-        ingress_address = wait_for_ingress_address(self.namespace)
-        if not ingress_address:
-            print_colored("Failed to obtain ingress address. You may need to configure it manually.", "red")
-
-        hopsworks_url = get_hopsworks_url(self.namespace)
-        if hopsworks_url:
-            ingress_host = hopsworks_url.replace("https://", "")
-            update_hosts_file(ingress_address, ingress_host)
-            print_colored(f"Hopsworks UI should be accessible at: {hopsworks_url}", "cyan")
-            print_colored("Default login: admin@hopsworks.ai, password: admin", "cyan")
+        load_balancer_address = self.get_load_balancer_address()
+        if not load_balancer_address:
+            print_colored("Failed to obtain LoadBalancer address. You may need to configure it manually.", "red")
         else:
-            print_colored("Unable to determine Hopsworks URL. Please check your ingress configuration.", "yellow")
+            print_colored(f"Hopsworks LoadBalancer address: {load_balancer_address}", "green")
+
+        hopsworks_url = f"https://{load_balancer_address}:28181"  # Note the added port
+        print_colored(f"Hopsworks UI should be accessible at: {hopsworks_url}", "cyan")
+        print_colored("Default login: admin@hopsworks.ai, password: admin", "cyan")
 
         if health_check(self.namespace):
             print_colored("\nHealth check passed. Hopsworks appears to be running correctly.", "green")
@@ -302,7 +387,7 @@ class HopsworksInstaller:
             "yellow"
         )
         print_colored(
-            "If you're having trouble accessing the UI, ensure your ingress and DNS are properly configured.",
+            "If you're having trouble accessing the UI, ensure your LoadBalancer and DNS are properly configured.",
             "yellow"
         )
         print_colored(
@@ -310,6 +395,36 @@ class HopsworksInstaller:
             "blue"
         )
 
+    def get_load_balancer_address(self):
+        if self.environment == "AWS":
+            cmd = f"kubectl get svc -n {self.namespace} hopsworks-release -o jsonpath='{{.status.loadBalancer.ingress[0].hostname}}'"
+        elif self.environment == "Azure":
+            cmd = f"kubectl get svc -n {self.namespace} hopsworks-release -o jsonpath='{{.status.loadBalancer.ingress[0].ip}}{{.status.loadBalancer.ingress[0].hostname}}'"
+        else:
+            cmd = f"kubectl get svc -n {self.namespace} hopsworks-release -o jsonpath='{{.status.loadBalancer.ingress[0].ip}}'"
+
+        success, output, _ = run_command(cmd, verbose=False)
+        if success and output.strip():
+            return output.strip()
+        else:
+            print_colored("Failed to retrieve LoadBalancer address for hopsworks-release. Checking alternatives...", "yellow")
+            
+            # Fallback to checking all LoadBalancer services
+            cmd = f"kubectl get svc -n {self.namespace} -o jsonpath='{{range .items}}{{if eq .spec.type \"LoadBalancer\"}}{{.metadata.name}}{{\"=\"}}{{.status.loadBalancer.ingress[0].ip}}{{\"\\n\"}}{{end}}{{end}}'"
+            success, output, _ = run_command(cmd, verbose=False)
+            if success and output.strip():
+                services = dict(line.split('=') for line in output.strip().split('\n'))
+                if 'hopsworks-release' in services:
+                    return services['hopsworks-release']
+                else:
+                    print_colored("Couldn't find hopsworks-release LoadBalancer. Available LoadBalancer services:", "yellow")
+                    for svc, ip in services.items():
+                        print(f"{svc}: {ip}")
+                    return None
+            else:
+                print_colored("Failed to retrieve any LoadBalancer addresses. Please check your service configuration.", "yellow")
+                return None
+            
 def print_colored(message, color, **kwargs):
     colors = {
         "red": "\033[91m", "green": "\033[92m", "yellow": "\033[93m",
@@ -318,17 +433,18 @@ def print_colored(message, color, **kwargs):
     }
     print(f"{colors.get(color, '')}{message}{colors['reset']}", **kwargs)
 
-def run_command(command, verbose=False):
+def run_command(command, verbose=True):
     if verbose:
         print_colored(f"Running: {command}", "cyan")
     try:
         result = subprocess.run(
             command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
-        if verbose and result.stdout:
-            print(result.stdout)
-        if result.stderr:
-            print_colored(result.stderr, "yellow")
+        if verbose:
+            if result.stdout:
+                print(result.stdout)
+            if result.stderr:
+                print_colored(result.stderr, "yellow")
         return result.returncode == 0, result.stdout, result.stderr
     except Exception as e:
         return False, "", str(e)
@@ -340,25 +456,21 @@ def get_user_input(prompt, options=None):
             return response
         print_colored(f"Invalid input. Expected one of: {', '.join(options)}", "yellow")
 
-def get_deployment_environment():
-    environments = list(ENV_CONFIGS.keys()) + ["On-Premise/VM"]
-    print_colored("Select your deployment environment:", "blue")
-    for i, env in enumerate(environments, 1):
-        print(f"{i}. {env}")
-    choice = get_user_input(
-        "Enter the number of your environment:",
-        [str(i) for i in range(1, len(environments) + 1)]
-    )
-    return environments[int(choice) - 1]
-
 def periodic_status_update(stop_event, namespace):
     while not stop_event.is_set():
         cmd = f"kubectl get pods -n {namespace} --no-headers"
-        success, output, _ = run_command(cmd, verbose=False)
-        if success:
+        success, output, error = run_command(cmd, verbose=False)
+        if success and output.strip():
             pod_count = len(output.strip().split('\n'))
             print_colored(f"\rCurrent status: {pod_count} pods created", "cyan", end='')
+        else:
+            if "No resources found" in error:
+                print_colored("\rWaiting for pods to be created...", "yellow", end='')
+            else:
+                print_colored(f"\rError checking pod status: {error.strip()}", "red", end='')
+        sys.stdout.flush()  # Ensure the output is displayed immediately
         time.sleep(10)  # Update every 10 seconds
+    print()  # Print a newline when done to move to the next line
 
 def get_license_agreement():
     print_colored("\nChoose a license agreement:", "blue")
@@ -411,66 +523,6 @@ def send_user_data(name, email, company, license_type, agreed_to_license):
         print_colored(f"Failed to send user data: {str(e)}", "red")
         return False, installation_id
 
-def create_aws_load_balancer_controller(cluster_name, region, namespace):
-    print_colored("Setting up AWS Load Balancer Controller...", "blue")
-
-    # Add EKS repo
-    if not run_command("helm repo add eks https://aws.github.io/eks-charts")[0]:
-        print_colored("Failed to add EKS Helm repo.", "red")
-        return False
-
-    # Update Helm repos
-    if not run_command("helm repo update")[0]:
-        print_colored("Failed to update Helm repos.", "red")
-        return False
-
-    # Create IAM service account
-    cmd_iam = f"""
-    eksctl create iamserviceaccount \
-    --cluster={cluster_name} \
-    --namespace=kube-system \
-    --name=aws-load-balancer-controller \
-    --attach-policy-arn=arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess \
-    --override-existing-serviceaccounts \
-    --approve \
-    --region={region}
-    """
-    if not run_command(cmd_iam)[0]:
-        print_colored("Failed to create IAM service account for AWS Load Balancer Controller.", "red")
-        return False
-
-    # Install the controller
-    cmd_install = f"""
-    helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
-    -n kube-system \
-    --set clusterName={cluster_name} \
-    --set serviceAccount.create=false \
-    --set serviceAccount.name=aws-load-balancer-controller
-    """
-    if not run_command(cmd_install)[0]:
-        print_colored("Failed to install AWS Load Balancer Controller.", "red")
-        return False
-
-    print_colored("AWS Load Balancer Controller setup completed.", "green")
-    return True
-
-def setup_ingress(environment, namespace, cluster_name=None, region=None):
-    if environment == "AWS":
-        if cluster_name is None or region is None:
-            print_colored("Cluster name and region are required for AWS setup.", "red")
-            return False
-        return create_aws_load_balancer_controller(cluster_name, region, namespace)
-    else:
-        env_config = ENV_CONFIGS.get(environment, {})
-        setup_cmd = env_config.get('setup_cmd', '')
-        if setup_cmd:
-            if "{cluster_name}" in setup_cmd:
-                setup_cmd = setup_cmd.format(cluster_name=cluster_name)
-            if "{namespace}" in setup_cmd:
-                setup_cmd = setup_cmd.format(namespace=namespace)
-            return run_command(setup_cmd)[0]
-    return True
-
 def wait_for_pods_ready(namespace, timeout=600, readiness_threshold=0.7):
     print_colored("Checking pod readiness...", "yellow")
     start_time = time.time()
@@ -505,92 +557,14 @@ def wait_for_pods_ready(namespace, timeout=600, readiness_threshold=0.7):
             print_colored("\nFailed to get pod status. Retrying...", "yellow")
             time.sleep(5)
         
-        if time.time() - start_time > 300:  # 5 minutes passed
-            proceed = get_user_input("\nTaking longer than expected. Do you want to proceed anyway? (yes/no): ", ["yes", "no"])
+        if time.time() - start_time > 30:  # 5 minutes passed
+            proceed = get_user_input("\nMost of the pods are ready! Proceed? (yes/no): ", ["yes", "no"])
             if proceed.lower() == "yes":
                 print_colored("Proceeding with installation...", "yellow")
                 return True
 
     print_colored("\nTimed out waiting for pods to be ready.", "red")
     return False
-
-def wait_for_ingress_address(namespace, timeout=600):
-    print_colored("\nWaiting for ingress address to be assigned...", "yellow")
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        cmd = (
-            f"kubectl get ingress -n {namespace} "
-            f"-o jsonpath='{{.items[0].status.loadBalancer.ingress[0].ip}}"
-            f"{{.items[0].status.loadBalancer.ingress[0].hostname}}'"
-        )
-        _, output, _ = run_command(cmd, verbose=False)
-        if output.strip():
-            print_colored(f"Ingress address found: {output.strip()}", "green")
-            return output.strip()
-        time.sleep(10)
-    print_colored("Timed out waiting for ingress address to be assigned.", "red")
-    return None
-
-def get_hopsworks_url(namespace):
-    cmd = f"kubectl get ingress -n {namespace} -o jsonpath='{{.items[0].spec.rules[0].host}}'"
-    success, host_output, _ = run_command(cmd, verbose=False)
-    if success and host_output.strip():
-        host = host_output.strip()
-    else:
-        print_colored(
-            "Failed to retrieve Hopsworks URL from ingress. Defaulting to hopsworks.ai.local",
-            "yellow"
-        )
-        host = "hopsworks.ai.local"
-
-    return f"https://{host}"
-
-def update_hosts_file(ingress_address, ingress_host):
-    print_colored(
-        "\nTo access Hopsworks UI, you may need to update your /etc/hosts file.",
-        "yellow"
-    )
-    print_colored("Add the following entry to your /etc/hosts file:", "cyan")
-    hosts_entry = f"{ingress_address} {ingress_host}"
-    print_colored(hosts_entry, "green")
-    update_hosts = get_user_input(
-        "Would you like the script to attempt to update your /etc/hosts file? (yes/no):",
-        ["yes", "no"]
-    ).lower() == "yes"
-    if update_hosts:
-        try:
-            with open("/etc/hosts", "a") as hosts_file:
-                hosts_file.write(f"\n{hosts_entry}\n")
-            print_colored("Successfully updated /etc/hosts.", "green")
-        except PermissionError:
-            print_colored("Permission denied when trying to update /etc/hosts.", "yellow")
-            use_sudo = get_user_input(
-                "Do you want to try updating /etc/hosts using sudo? (yes/no): ", ["yes", "no"]
-            ).lower() == "yes"
-            if use_sudo:
-                sudo_command = f"echo '{hosts_entry}' | sudo tee -a /etc/hosts"
-                success, _, error = run_command(sudo_command)
-                if success:
-                    print_colored("Successfully updated /etc/hosts using sudo.", "green")
-                else:
-                    print_colored("Failed to update /etc/hosts even with sudo.", "red")
-                    print_colored(
-                        "Please manually add the following entry to your /etc/hosts file:",
-                        "yellow"
-                    )
-                    print_colored(hosts_entry, "green")
-            else:
-                print_colored(
-                    "Please manually add the following entry to your /etc/hosts file:",
-                    "yellow"
-                )
-                print_colored(hosts_entry, "green")
-    else:
-        print_colored(
-            "Please manually add the following entry to your /etc/hosts file:",
-            "yellow"
-        )
-        print_colored(hosts_entry, "green")
 
 def health_check(namespace):
     print_colored("\nPerforming basic health check...", "blue")
@@ -605,5 +579,5 @@ def health_check(namespace):
     return True
 
 if __name__ == "__main__":
-    installer = HopsworksInstaller()
+    installer = HopsworksInstaller(),
     installer.run()
