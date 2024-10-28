@@ -579,5 +579,5 @@ def health_check(namespace):
     return True
 
 if __name__ == "__main__":
-    installer = HopsworksInstaller(),
+    installer = HopsworksInstaller()
     installer.run()

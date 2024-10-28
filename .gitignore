@@ -3,3 +3,4 @@ hopsworks-ingress.yaml
 policy
 set_kubeconfig.sh
 installation_log.txt
+gcp.txt
