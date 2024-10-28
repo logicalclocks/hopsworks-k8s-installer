@@ -126,9 +126,9 @@ class HopsworksInstaller:
             project_id = input("Enter your GCP project ID: ").strip()
             region = input("Enter your GCP region: ").strip()
             cmd = f"gcloud container clusters get-credentials {cluster_name} --project {project_id} --region {region}"
-        if not run_command(cmd)[0]:
-            print_colored("Failed to get GKE credentials. Check your gcloud setup.", "red")
-            return None, None, None
+            if not run_command(cmd)[0]:
+                print_colored("Failed to get GKE credentials. Check your gcloud setup.", "red")
+                return None, None, None
             run_command("gcloud auth configure-docker", verbose=False)
             kubeconfig_path = os.path.expanduser("~/.kube/config")
 
@@ -331,7 +331,7 @@ class HopsworksInstaller:
             for key, value in aks_helm_addition.items():
                 helm_command += f" --set {key}={value} "
         elif self.environment == "GCP":
-            for key, value in aks_helm_addition.items():
+            for key, value in gke_helm_addition.items():
                 helm_command += f" --set {key}={value} "
 
         if self.use_managed_registry:
