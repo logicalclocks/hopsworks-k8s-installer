@@ -56,7 +56,10 @@ gke_helm_addition = {
     "hopsworks.replicaCount.worker": "1",
     "rondb.clusterSize.activeDataReplicas": "1",
     "hopsworks.service.worker.external.https.type": "LoadBalancer",
-    "hopsfs.datanode.count": "2"
+    "hopsfs.datanode.count": "2",
+    "global._hopsworks.managedDockerRegistery.enabled": "true",
+    "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
+    "global._hopsworks.managedDockerRegistery.credHelper.secretName": "gcrregcred"
 }
 
 class HopsworksInstaller:
@@ -68,6 +71,7 @@ class HopsworksInstaller:
         self.namespace = 'hopsworks'
         self.installation_id = None
         self.args = None
+        self.project_id = None
         self.use_managed_registry = False
         self.managed_registry_info = None
 
@@ -120,12 +124,16 @@ class HopsworksInstaller:
                     print_colored("Failed to update kubeconfig.", "red")
                     return None, None, None
             kubeconfig_path = os.path.expanduser("~/.kube/config")
-            
-        elif self.environment =="GCP":
+
+        elif self.environment == "GCP":
             cluster_name = input("Enter your GKE cluster name: ").strip()
-            project_id = input("Enter your GCP project ID: ").strip()
-            region = input("Enter your GCP region: ").strip()
-            cmd = f"gcloud container clusters get-credentials {cluster_name} --project {project_id} --region {region}"
+            self.project_id = input("Enter your GCP project ID: ").strip()
+            zone_input = input("Enter your GCP region (e.g. europe-west1-b): ").strip()
+            region = '-'.join(zone_input.split('-')[:-1]) if zone_input.count('-') > 1 else zone_input
+            self.region = region 
+            self.zone = zone_input
+            cmd = f"gcloud container clusters get-credentials {cluster_name} --project {self.project_id} --region {self.zone}"
+                        
             if not run_command(cmd)[0]:
                 print_colored("Failed to get GKE credentials. Check your gcloud setup.", "red")
                 return None, None, None
@@ -195,7 +203,7 @@ class HopsworksInstaller:
         self.namespace = self.args.namespace
 
     def get_deployment_environment(self):
-        environments = ["AWS", "Azure", "GCP", "OVH", "On-Premise/VM"]
+        environments = ["AWS", "Azure", "GCP", "OVH"]
         print_colored("Select your deployment environment:", "blue")
         for i, env in enumerate(environments, 1):
             print(f"{i}. {env}")
@@ -226,13 +234,11 @@ class HopsworksInstaller:
         if self.environment == "AWS":
             print_colored("Setting up AWS ECR (required for AWS installations)...", "blue")
             self.setup_aws_ecr()
-        elif self.environment == "Azure":
-            self.use_managed_registry = get_user_input("Do you want to use a managed registry? (yes/no):", ["yes", "no"]).lower() == "yes"
-            if self.use_managed_registry:
-                self.setup_azure_acr()
-        else:
-            print_colored(f"Managed registry setup for {self.environment} is not implemented yet.", "yellow")
-            self.use_managed_registry = False
+        elif self.environment == "GCP":
+            print_colored("Setting up GCP Artifact Registry (required for GKE installations)...", "blue")
+            if not self.setup_gke_registry():
+                print_colored("GCP Artifact Registry setup failed. Cannot proceed with installation.", "red")
+                sys.exit(1)
                             
     def setup_aws_ecr(self):
         client = boto3.client('ecr', region_name=self.region)
@@ -249,7 +255,45 @@ class HopsworksInstaller:
         }
         print_colored(f"ECR repository set up: {repo_uri}", "green")
 
+    def setup_gke_registry(self):
+        try:
+            print(f"Debug - Full region details:")
+            print(f"  Region: {self.region}")
+            print(f"  Zone: {self.zone}")
+            print(f"  Project: {self.project_id}")
+            registry_cmd = (
+                f"gcloud artifacts repositories create hopsworks-{self.cluster_name} "
+                f"--repository-format=docker "
+                f"--location={self.region} "
+                f"--project={self.project_id} "
+            )
+            create_success, _, create_error = run_command(registry_cmd, verbose=True)
+            
+            if not create_success:
+                if "already exists" in str(create_error):
+                    print_colored("Repository already exists, proceeding with existing repository.", "yellow")
+                else:
+                    print_colored("Failed to create GCP Artifact Registry repository.", "red")
+                    return False
 
+            auth_cmd = f"gcloud auth configure-docker {self.region}-docker.pkg.dev"
+            if not run_command(auth_cmd)[0]:
+                print_colored("Failed to configure Docker authentication for Artifact Registry.", "red")
+                return False
+
+            self.managed_registry_info = {
+                "domain": f"{self.region}-docker.pkg.dev/{self.project_id}",
+                "namespace": f"hopsworks-{self.cluster_name}"
+            }
+            self.use_managed_registry = True
+
+            print_colored("GCP Artifact Registry setup completed successfully.", "green")
+            return True
+
+        except Exception as e:
+            print_colored(f"Unexpected error during GCP Artifact Registry setup: {str(e)}", "red")
+            return False
+            
     def setup_azure_acr(self):
         cmd = f"az acr list --resource-group {self.resource_group} --query \"[0].name\" -o tsv"
         success, acr_name, _ = run_command(cmd, verbose=False)
@@ -341,7 +385,7 @@ class HopsworksInstaller:
                 f" --set global._hopsworks.managedDockerRegistery.namespace={self.managed_registry_info['namespace']}"
             )
             if self.environment == "AWS":
-                helm_command += f" --set global._hopsworks.managedDockerRegistery.credHelper.enabled=true"
+                helm_command += " --set global._hopsworks.managedDockerRegistery.credHelper.enabled=true"
 
         helm_command += " --timeout 60m --wait --devel"
 
