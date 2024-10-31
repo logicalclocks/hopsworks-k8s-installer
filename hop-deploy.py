@@ -5,7 +5,6 @@ import time
 import sys
 import os
 import uuid
-import json
 import shutil
 import argparse
 from datetime import datetime
@@ -14,6 +13,9 @@ import urllib.error
 import ssl
 import threading
 import boto3
+import base64  
+import json   
+import tempfile  
 
 HOPSWORKS_LOGO = """
 ██╗  ██╗    ██████╗    ██████╗    ███████╗   ██╗    ██╗    ██████╗    ██████╗    ██╗  ██╗   ███████╗
@@ -57,7 +59,6 @@ gke_helm_addition = {
     "rondb.clusterSize.activeDataReplicas": "1",
     "hopsworks.service.worker.external.https.type": "LoadBalancer",
     "hopsfs.datanode.count": "2",
-    "global._hopsworks.managedDockerRegistery.enabled": "true",
     "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
     "global._hopsworks.managedDockerRegistery.credHelper.secretName": "gcrregcred",
     "hopsworks.docker.registry.password": "WILL_BE_REPLACED",  # we handles this
@@ -108,21 +109,65 @@ class HopsworksInstaller:
                 if not get_user_input("Do you want to try again? (yes/no):", ["yes", "no"]).lower() == "yes":
                     sys.exit(1)
                     
+    def create_registry_secret(self, namespace, key_file_content):
+        """Creates a properly labeled registry secret for Helm compatibility"""
+        # Create secret manifest as a JSON string instead of YAML
+        secret_manifest = json.dumps({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "gcrregcred",
+                "namespace": namespace,
+                "labels": {
+                    "app.kubernetes.io/managed-by": "Helm"
+                },
+                "annotations": {
+                    "meta.helm.sh/release-name": "hopsworks-release",
+                    "meta.helm.sh/release-namespace": namespace
+                }
+            },
+            "type": "kubernetes.io/dockerconfigjson",
+            "data": {
+                ".dockerconfigjson": base64.b64encode(
+                    json.dumps({
+                        "auths": {
+                            f"{self.region}-docker.pkg.dev": {
+                                "username": "_json_key",
+                                "password": key_file_content,
+                                "email": "not-needed@example.com"
+                            }
+                        }
+                    }).encode()
+                ).decode()
+            }
+        })
+        
+        # Write manifest to temp file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            f.write(secret_manifest)
+            secret_file = f.name
+        
+        # Apply the secret using kubectl
+        run_command(f"kubectl apply -f {secret_file}")
+        os.remove(secret_file)  # Clean up
+                
     def setup_gke_authentication(self):
         """Sets up GKE service account and registry authentication"""    
+        print_colored("\nSetting up GCP service account and registry authentication...", "cyan")
+        
+        # Create service account
         sa_name = f"hopsworks-{self.cluster_name}"
         sa_email = f"{sa_name}@{self.project_id}.iam.gserviceaccount.com"
         
-        # Create service account
         run_command(f"gcloud iam service-accounts create {sa_name} "
                     f"--project={self.project_id} "
                     f"--display-name='Hopsworks Service Account'")
         
         # Set required roles
         roles = [
-            "roles/storage.admin",          # For bucket/object management
-            "roles/artifactregistry.admin", # For container registry
-            "roles/container.admin"         # For GKE access
+            "roles/storage.admin",          
+            "roles/artifactregistry.admin", 
+            "roles/container.admin"         
         ]
         
         for role in roles:
@@ -130,24 +175,23 @@ class HopsworksInstaller:
                     f"--member=serviceAccount:{sa_email} "
                     f"--role={role}")
         
-        # Create and download key for registry auth
+        # Create and download key
         key_file = f"{sa_name}-key.json"
         run_command(f"gcloud iam service-accounts keys create {key_file} "
                     f"--iam-account={sa_email}")
         
-        # Create registry secret in the namespace
-        print_colored("\nCreating registry authentication secret...", "cyan")
+        # Read key file content
+        with open(key_file, 'r') as f:
+            key_content = f.read()
+        
+        # Create namespace if it doesn't exist
         run_command(f"kubectl create namespace {self.namespace} --dry-run=client -o yaml | kubectl apply -f -")
-        run_command(f"kubectl create secret docker-registry gcrregcred "
-                    f"--docker-server={self.region}-docker.pkg.dev "
-                    f"--docker-username=_json_key "
-                    f"--docker-password=\"$(cat {key_file})\" "
-                    f"--docker-email=not-needed@example.com "
-                    f"--namespace={self.namespace}")
+        
+        # Create properly labeled secret
+        self.create_registry_secret(self.namespace, key_content)
         
         # Cleanup
         os.remove(key_file)
-        
         return sa_email
     
     def setup_kubeconfig(self):
@@ -555,7 +599,7 @@ def periodic_status_update(stop_event, namespace):
             print_colored(f"\rCurrent status: {pod_count} pods created", "cyan", end='')
         else:
             if "No resources found" in error:
-                print_colored("\rWaiting for pods to be created...", "yellow", end='')
+                print_colored(f"\rWaiting for pods to be created... Do not panic. This will take a moment", "yellow", end='')
             else:
                 print_colored(f"\rError checking pod status: {error.strip()}", "red", end='')
         sys.stdout.flush()  # Ensure the output is displayed immediately
