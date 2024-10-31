@@ -59,7 +59,9 @@ gke_helm_addition = {
     "hopsfs.datanode.count": "2",
     "global._hopsworks.managedDockerRegistery.enabled": "true",
     "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
-    "global._hopsworks.managedDockerRegistery.credHelper.secretName": "gcrregcred"
+    "global._hopsworks.managedDockerRegistery.credHelper.secretName": "gcrregcred",
+    "hopsworks.docker.registry.password": "WILL_BE_REPLACED",  # we handles this
+    "hopsworks.docker.registry.username": "_json_key"
 }
 
 class HopsworksInstaller:
@@ -81,6 +83,7 @@ class HopsworksInstaller:
         self.parse_arguments()
         self.get_deployment_environment()
         self.setup_and_verify_kubeconfig()
+        self.setup_gke_authentication()
         self.handle_managed_registry()
 
         if not self.args.loadbalancer_only:
@@ -104,7 +107,49 @@ class HopsworksInstaller:
                 print_colored("Failed to set up a valid kubeconfig.", "red")
                 if not get_user_input("Do you want to try again? (yes/no):", ["yes", "no"]).lower() == "yes":
                     sys.exit(1)
-
+                    
+    def setup_gke_authentication(self):
+        """Sets up GKE service account and registry authentication"""    
+        sa_name = f"hopsworks-{self.cluster_name}"
+        sa_email = f"{sa_name}@{self.project_id}.iam.gserviceaccount.com"
+        
+        # Create service account
+        run_command(f"gcloud iam service-accounts create {sa_name} "
+                    f"--project={self.project_id} "
+                    f"--display-name='Hopsworks Service Account'")
+        
+        # Set required roles
+        roles = [
+            "roles/storage.admin",          # For bucket/object management
+            "roles/artifactregistry.admin", # For container registry
+            "roles/container.admin"         # For GKE access
+        ]
+        
+        for role in roles:
+            run_command(f"gcloud projects add-iam-policy-binding {self.project_id} "
+                    f"--member=serviceAccount:{sa_email} "
+                    f"--role={role}")
+        
+        # Create and download key for registry auth
+        key_file = f"{sa_name}-key.json"
+        run_command(f"gcloud iam service-accounts keys create {key_file} "
+                    f"--iam-account={sa_email}")
+        
+        # Create registry secret in the namespace
+        print_colored("\nCreating registry authentication secret...", "cyan")
+        run_command(f"kubectl create namespace {self.namespace} --dry-run=client -o yaml | kubectl apply -f -")
+        run_command(f"kubectl create secret docker-registry gcrregcred "
+                    f"--docker-server={self.region}-docker.pkg.dev "
+                    f"--docker-username=_json_key "
+                    f"--docker-password=\"$(cat {key_file})\" "
+                    f"--docker-email=not-needed@example.com "
+                    f"--namespace={self.namespace}")
+        
+        # Cleanup
+        os.remove(key_file)
+        
+        return sa_email
+    
     def setup_kubeconfig(self):
         print_colored(f"\nSetting up kubeconfig for {self.environment}...", "blue")
 
@@ -282,9 +327,10 @@ class HopsworksInstaller:
                 return False
 
             self.managed_registry_info = {
-                "domain": f"{self.region}-docker.pkg.dev/{self.project_id}",
-                "namespace": f"hopsworks-{self.cluster_name}"
+                "domain": f"{self.region}-docker.pkg.dev",  # Changed this
+                "namespace": f"{self.project_id}/hopsworks-{self.cluster_name}"  # And this
             }
+
             self.use_managed_registry = True
 
             print_colored("GCP Artifact Registry setup completed successfully.", "green")
