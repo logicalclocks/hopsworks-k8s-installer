@@ -21,10 +21,10 @@ python3 install-hopsworks.py | tee installation_log.txt
 ```
 
 ## Command-line Options
-`--loadbalancer-only`: Skip installation and jump to LoadBalancer setup
-`--no-user-data`: Skip sending user data
-`--skip-license`: Skip license agreement step
-`--namespace NAMESPACE`: Specify a custom namespace (default: 'hopsworks')
+- `--loadbalancer-only`: Skip installation and jump to LoadBalancer setup
+- `--no-user-data`: Skip sending user data
+- `--skip-license`: Skip license agreement step
+- `--namespace NAMESPACE`: Specify a custom namespace (default: 'hopsworks')
 
 ## Post-Installation
 After successful installation, the script will provide:
