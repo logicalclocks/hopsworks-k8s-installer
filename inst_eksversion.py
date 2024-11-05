@@ -31,7 +31,7 @@ HOPSWORKS_LOGO = """
 SERVER_URL = "https://magiclex--hopsworks-installation-hopsworks-installation.modal.run/"
 STARTUP_LICENSE_URL = "https://www.hopsworks.ai/startup-license"
 EVALUATION_LICENSE_URL = "https://www.hopsworks.ai/evaluation-license"
-INSTALL_RAW = "https://raw.githubusercontent.com/MagicLex/hopsworks-k8s-installer/master"
+INSTALL_RAW = "https://raw.githubusercontent.com/MagicLex/hopsworks-k8s-installer/refs/heads/master/assets"
 
 def print_colored(message, color, **kwargs):
     colors = {
