@@ -1,0 +1,48 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "hopsworksaiInstanceProfile",
+      "Effect": "Allow",
+      "Action": [
+        "S3:PutObject",
+        "S3:ListBucket",
+        "S3:GetObject",
+        "S3:DeleteObject",
+        "S3:AbortMultipartUpload",
+        "S3:ListBucketMultipartUploads",
+        "S3:PutLifecycleConfiguration",
+        "S3:GetLifecycleConfiguration",
+        "S3:PutBucketVersioning",
+        "S3:GetBucketVersioning",
+        "S3:ListBucketVersions",
+        "S3:DeleteObjectVersion"
+      ],
+      "Resource": [
+        "arn:aws:s3:::l3xbucket/*",
+        "arn:aws:s3:::l3xbucket"
+      ]
+    },
+    {
+      "Sid": "AllowPushandPullImagesToUserRepo",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage",
+        "ecr:CompleteLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:InitiateLayerUpload",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:PutImage",
+        "ecr:ListImages",
+        "ecr:BatchDeleteImage",
+        "ecr:GetLifecyclePolicy",
+        "ecr:PutLifecyclePolicy",
+        "ecr:TagResource"
+      ],
+      "Resource": [
+        "arn:aws:ecr:eu-west-1:755182613526:repository/*/hopsworks-base"
+      ]
+    }
+  ]
+}
