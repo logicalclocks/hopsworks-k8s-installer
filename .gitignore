@@ -1,7 +1,6 @@
-hopsworks
-hopsworks-ingress.yaml
+.DS_store
+mini
 policy
 set_kubeconfig.sh
 installation_log.txt
-instruct.md
-clean_google.sh
+
