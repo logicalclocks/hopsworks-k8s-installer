@@ -16,6 +16,7 @@ import boto3
 import base64
 import json
 import tempfile
+import yaml
 
 HOPSWORKS_LOGO = """
 ██╗  ██╗    ██████╗    ██████╗    ███████╗   ██╗    ██╗    ██████╗    ██████╗    ██╗  ██╗   ███████╗
@@ -30,44 +31,6 @@ SERVER_URL = "https://magiclex--hopsworks-installation-hopsworks-installation.mo
 STARTUP_LICENSE_URL = "https://www.hopsworks.ai/startup-license"
 EVALUATION_LICENSE_URL = "https://www.hopsworks.ai/evaluation-license"
 
-eks_helm_addition = {
-    "global._hopsworks.cloudProvider": "AWS",
-    "global._hopsworks.imagePullPolicy": "Always",
-    "hopsworks.replicaCount.worker": "1",
-    "rondb.clusterSize.activeDataReplicas": "1",
-    "hopsworks.service.worker.external.https.type": "LoadBalancer",
-    "global._hopsworks.managedDockerRegistery.credHelper.secretName": "awsregcred",
-    "hopsworks.variables.docker_operations_managed_docker_secrets": "awsregcred",
-    "hopsworks.variables.docker_operations_image_pull_secrets": "awsregcred",
-    "hopsworks.dockerRegistry.preset.secrets[0]": "awsregcred",
-    "hopsfs.datanode.count": "2"
-}
-
-aks_helm_addition = {
-    "global._hopsworks.cloudProvider": "AZURE",
-    "global._hopsworks.imagePullPolicy": "Always",
-    "hopsworks.replicaCount.worker": "1",
-    "rondb.clusterSize.activeDataReplicas": "1",
-    "hopsworks.service.worker.external.https.type": "LoadBalancer",
-    "hopsfs.datanode.count": "2"
-}
-
-gke_helm_addition = {
-    "global._hopsworks.cloudProvider": "GCP",
-    "global._hopsworks.imagePullPolicy": "Always",
-    "hopsworks.replicaCount.worker": "1",
-    "rondb.clusterSize.activeDataReplicas": "1",
-    "hopsworks.service.worker.external.https.type": "LoadBalancer",
-    "hopsfs.datanode.count": "2",
-    "global._hopsworks.managedDockerRegistery.enabled": "true",
-    "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
-    "global._hopsworks.managedDockerRegistery.credHelper.secretName": "gcrregcred",
-    "hopsworks.variables.docker_operations_managed_docker_secrets": "gcrregcred",
-    "hopsworks.variables.docker_operations_image_pull_secrets": "regcred,gcrregcred",
-    "hopsworks.dockerRegistry.preset.secrets[0]": "gcrregcred"
-}
-
-
 class HopsworksInstaller:
     def __init__(self):
         self.environment = None
@@ -80,18 +43,22 @@ class HopsworksInstaller:
         self.project_id = None
         self.use_managed_registry = False
         self.managed_registry_info = None
+        self.sa_email = None  # Added to store service account email
 
     def run(self):
         print_colored(HOPSWORKS_LOGO, "white")
-        self.check_required_tools()
         self.parse_arguments()
-        self.get_deployment_environment()
-        self.setup_and_verify_kubeconfig()
-        if self.environment == "GCP":
-            self.setup_gke_authentication()
-        self.handle_managed_registry()
+        self.check_required_tools()
 
         if not self.args.loadbalancer_only:
+            self.get_deployment_environment()
+            self.setup_and_verify_kubeconfig()
+            if self.environment == "GCP":
+                self.setup_gke_authentication()
+                if not self.verify_workload_identity():
+                    print_colored("Exiting due to workload identity misconfiguration.", "red")
+                    sys.exit(1)
+            self.handle_managed_registry()
             self.handle_license_and_user_data()
             if self.install_hopsworks():
                 print_colored("\nHopsworks installation completed.", "green")
@@ -100,11 +67,18 @@ class HopsworksInstaller:
                 print_colored("Hopsworks installation failed. Please check the logs and try again.", "red")
                 sys.exit(1)
         else:
+            # For loadbalancer-only, we need to set up the necessary variables
+            self.namespace = self.args.namespace
+            if not self.args.environment:
+                print_colored("When using --loadbalancer-only, you must specify the environment using --environment.", "red")
+                sys.exit(1)
+            self.environment = self.args.environment
+            self.setup_and_verify_kubeconfig(loadbalancer_only=True)
             self.finalize_installation()
 
-    def setup_and_verify_kubeconfig(self):
+    def setup_and_verify_kubeconfig(self, loadbalancer_only=False):
         while True:
-            self.kubeconfig_path, self.cluster_name, self.region = self.setup_kubeconfig()
+            self.kubeconfig_path, self.cluster_name, self.region = self.setup_kubeconfig(loadbalancer_only=loadbalancer_only)
             if self.kubeconfig_path:
                 if self.verify_kubeconfig():
                     break
@@ -114,156 +88,107 @@ class HopsworksInstaller:
                     sys.exit(1)
 
     def setup_gke_authentication(self):
+        """Setup GKE auth with proper Workload Identity"""
+        # 1. Create single service account for everything
         sa_name = f"hopsworks-{self.cluster_name}"
         sa_email = f"{sa_name}@{self.project_id}.iam.gserviceaccount.com"
+        self.sa_email = sa_email  # Store sa_email as instance variable
 
-        # Create SA if not exists
-        run_command(f"gcloud iam service-accounts create {sa_name} --project={self.project_id}")
+        print_colored("Creating service account...", "cyan")
+        run_command(f"gcloud iam service-accounts create {sa_name} "
+                    f"--project={self.project_id} "
+                    f"--description='Service account for Hopsworks' "
+                    f"--display-name='Hopsworks Service Account'")
 
-        # Add all required roles
-        roles = [
-            "roles/artifactregistry.admin",
-            "roles/storage.admin",
-            "roles/iam.workloadIdentityUser",
-            "roles/artifactregistry.writer"
-        ]
-
-        for role in roles:
+        # 2. Create role with ALL needed permissions in one place
+        role_file = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False)
+        try:
+            role_def = {
+                "title": "Hopsworks Instance Role",
+                "description": "Combined role for Hopsworks operations",
+                "stage": "GA",
+                "includedPermissions": [
+                    # Artifact Registry permissions
+                    "artifactregistry.repositories.create",
+                    "artifactregistry.repositories.get",
+                    "artifactregistry.repositories.list",
+                    "artifactregistry.repositories.uploadArtifacts",
+                    "artifactregistry.repositories.downloadArtifacts",
+                    "artifactregistry.tags.list",
+                    "artifactregistry.repositories.listDockerImages",
+                    # Storage permissions if needed
+                    "storage.buckets.get",
+                    "storage.buckets.list",
+                    "storage.objects.create",
+                    "storage.objects.delete",
+                    "storage.objects.get",
+                    "storage.objects.list"
+                ]
+            }
+            yaml.dump(role_def, role_file)
+            role_file.close()
+            
+            role_name = f"hopsworks.{self.cluster_name}"
+            run_command(f"gcloud iam roles create {role_name} "
+                       f"--project={self.project_id} "
+                       f"--file={role_file.name}")
+            
+            # Bind the role
             run_command(f"gcloud projects add-iam-policy-binding {self.project_id} "
-                        f"--member=serviceAccount:{sa_email} --role={role}")
+                       f"--member=serviceAccount:{sa_email} "
+                       f"--role=projects/{self.project_id}/roles/{role_name}")
+        finally:
+            os.unlink(role_file.name)
 
-        # Fix the workload identity binding - this was wrong before
-        run_command(f"""
-            gcloud iam service-accounts add-iam-policy-binding {sa_email} \
-            --role="roles/iam.workloadIdentityUser" \
-            --member="serviceAccount:{self.project_id}.svc.id.goog[{self.namespace}/pod-annotator]"
-        """)
-
-        # Ensure namespace exists before creating resources in it
+        # 3. Create and bind Kubernetes service account
+        print_colored("Setting up Kubernetes service account...", "cyan")
         run_command(f"kubectl create namespace {self.namespace} --dry-run=client -o yaml | kubectl apply -f -")
+        run_command(f"kubectl create serviceaccount -n {self.namespace} hopsworks-sa")
+        
+        # Bind the GCP SA to K8s SA
+        workload_binding = (
+            f"gcloud iam service-accounts add-iam-policy-binding {sa_email} "
+            f"--role roles/iam.workloadIdentityUser "
+            f"--member \"serviceAccount:{self.project_id}.svc.id.goog[{self.namespace}/hopsworks-sa]\""
+        )
+        run_command(workload_binding)
 
-        # Set up the Docker config properly
+        # Annotate the K8s SA
+        run_command(
+            f"kubectl annotate serviceaccount -n {self.namespace} hopsworks-sa "
+            f"iam.gke.io/gcp-service-account={sa_email}"
+        )
+
+        # 4. Setup Docker config for both GCP and hops.works registries
         docker_config = {
             "credHelpers": {
-                f"{self.region}-docker.pkg.dev": "gcloud"
-            }
-        }
-
-        # Create it as a proper k8s config map
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump({"config.json": json.dumps(docker_config)}, f)
-            f.flush()
-            run_command(f"kubectl create configmap docker-config -n {self.namespace} --from-file={f.name}")
-            os.remove(f.name)
-
-        print_colored("GKE authentication setup completed", "green")
-
-    def create_registry_secret(self, namespace, key_file_content):
-        """Creates registry secrets and ConfigMap with proper auth for both registries"""
-
-        helm_metadata = {
-            "labels": {
-                "app.kubernetes.io/managed-by": "Helm",
-                "app.kubernetes.io/instance": "hopsworks-release"
-            },
-            "annotations": {
-                "meta.helm.sh/release-name": "hopsworks-release",
-                "meta.helm.sh/release-namespace": namespace
-            }
-        }
-
-        gcr_secret = {
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": "gcrregcred",
-                "namespace": namespace,
-                **helm_metadata
-            },
-            "type": "kubernetes.io/dockerconfigjson",
-            "data": {
-                ".dockerconfigjson": base64.b64encode(
-                    json.dumps({
-                        "credHelpers": {
-                            f"{self.region}-docker.pkg.dev": "gcloud"
-                        },
-                        "auths": {
-                            "docker.hops.works": {
-                                "username": "hopsworks",
-                                "password": "hopsworks",
-                                "auth": base64.b64encode(b"hopsworks:hopsworks").decode()
-                            }
-                        }
-                    }).encode()
-                ).decode()
-            }
-        }
-
-        # Apply the secrets
-        for secret_name in ["regcred", "gcrregcred"]:
-            run_command(f"kubectl delete secret {secret_name} -n {namespace} --ignore-not-found")
-
-        # Create both secrets
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(gcr_secret, f)
-            f.flush()
-            run_command(f"kubectl apply -f {f.name}")
-            os.remove(f.name)
-
-        run_command(f"""
-        kubectl patch serviceaccount default -n {namespace} -p '{{
-            "imagePullSecrets": [
-                {{"name": "gcrregcred"}},
-                {{"name": "regcred"}}
-            ]
-        }}'
-        """)
-
-        # Create ConfigMap with exactly the same structure
-        config_data = {
-            "credHelpers": {
-                f"{self.region}-docker.pkg.dev": "gcloud"
-            },
-            "auths": {
-                "docker.hops.works": {
-                    "username": "hopsworks",
-                    "password": "hopsworks",
-                    "auth": base64.b64encode(b"hopsworks:hopsworks").decode()
-                }
-            }
-        }
-
-        # Delete existing ConfigMap first
-        run_command(f"kubectl delete configmap docker-config -n {namespace} --ignore-not-found")
-
-        config_map = {
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {
-                "name": "docker-config",
-                "namespace": namespace,
-                **helm_metadata
-            },
-            "data": {
-                "config.json": json.dumps(config_data)
+                f"{self.region}-docker.pkg.dev": "gcloud",
+                "docker.hops.works": "gcloud"
             }
         }
 
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            f.write(json.dumps(config_map))
-            f.flush()
-            run_command(f"kubectl apply -f {f.name}")
-            os.remove(f.name)
+            json.dump(docker_config, f)
+            config_file = f.name
 
-    def setup_kubeconfig(self):
-        print_colored(f"\nSetting up kubeconfig for {self.environment}...", "blue")
+        run_command(f"kubectl create configmap docker-config -n {self.namespace} "
+                   f"--from-file=config.json={config_file} "
+                   f"--dry-run=client -o yaml | kubectl apply -f -")
+        
+        os.unlink(config_file)
+        return True
+
+    def setup_kubeconfig(self, loadbalancer_only=False):
+        if not loadbalancer_only:
+            print_colored(f"\nSetting up kubeconfig for {self.environment}...", "blue")
+        else:
+            print_colored(f"\nSetting up kubeconfig...", "blue")
 
         kubeconfig_path = None
         cluster_name = None
         region = None
 
         if self.environment == "AWS":
-            # Keep existing AWS logic
             cluster_name = input("Enter your EKS cluster name: ").strip()
             region = self.get_aws_region()
             cmd = f"aws eks get-token --cluster-name {cluster_name} --region {region}"
@@ -277,19 +202,22 @@ class HopsworksInstaller:
 
         elif self.environment == "GCP":
             cluster_name = input("Enter your GKE cluster name: ").strip()
-            self.project_id = input("Enter your GCP project ID: ").strip()
-            zone_input = input("Enter your GCP region (e.g. europe-west1-b): ").strip()
-            region = '-'.join(zone_input.split('-')[:-1]) if zone_input.count('-') > 1 else zone_input
-            self.region = region
-            self.zone = zone_input
-            cmd = f"gcloud container clusters get-credentials {cluster_name} --project {self.project_id} --region {self.zone}"
+            if not self.project_id:
+                self.project_id = input("Enter your GCP project ID: ").strip()
+            if not self.region:
+                zone_input = input("Enter your GCP zone (e.g. europe-west1-b): ").strip()
+                region = '-'.join(zone_input.split('-')[:-1]) if zone_input.count('-') > 1 else zone_input
+                self.region = region
+                self.zone = zone_input
 
+            cmd = f"gcloud container clusters get-credentials {cluster_name} --project {self.project_id} --zone {self.zone}"
             if not run_command(cmd)[0]:
                 print_colored("Failed to get GKE credentials. Check your gcloud setup.", "red")
                 return None, None, None
+
             run_command("gcloud auth configure-docker", verbose=False)
             kubeconfig_path = os.path.expanduser("~/.kube/config")
-
+    
         elif self.environment == "Azure":
             self.resource_group = input("Enter your Azure resource group name: ").strip()
             cluster_name = input("Enter your AKS cluster name: ").strip()
@@ -300,7 +228,7 @@ class HopsworksInstaller:
             kubeconfig_path = os.path.expanduser("~/.kube/config")
 
         else:
-            # Keep existing logic for other environments
+            # Other environments or when environment is not specified
             kubeconfig_path = input("Enter the path to your kubeconfig file: ").strip()
             kubeconfig_path = os.path.expanduser(kubeconfig_path)
             if not os.path.exists(kubeconfig_path):
@@ -349,29 +277,23 @@ class HopsworksInstaller:
         parser.add_argument('--no-user-data', action='store_true', help='Skip sending user data')
         parser.add_argument('--skip-license', action='store_true', help='Skip license agreement step')
         parser.add_argument('--namespace', default='hopsworks', help='Namespace for Hopsworks installation')
+        parser.add_argument('--environment', choices=['AWS', 'Azure', 'GCP', 'OVH'], help='Deployment environment')
         self.args = parser.parse_args()
         self.namespace = self.args.namespace
 
     def get_deployment_environment(self):
-        environments = ["AWS", "Azure", "GCP", "OVH"]
-        print_colored("Select your deployment environment:", "blue")
-        for i, env in enumerate(environments, 1):
-            print(f"{i}. {env}")
-        choice = get_user_input(
-            "Enter the number of your environment:",
-            [str(i) for i in range(1, len(environments) + 1)]
-        )
-        self.environment = environments[int(choice) - 1]
-
-    def print_current_kubeconfig(self):
-        print_colored("\nCurrent KUBECONFIG environment variable:", "cyan")
-        print(os.environ.get('KUBECONFIG', 'Not set'))
-
-        print_colored("\nContents of current kubeconfig:", "cyan")
-        cmd = "kubectl config view --raw"
-        success, output, error = run_command(cmd, verbose=True)
-        if not success:
-            print_colored(f"Failed to view kubeconfig. Error: {error}", "red")
+        if self.args.environment:
+            self.environment = self.args.environment
+        else:
+            environments = ["AWS", "Azure", "GCP", "OVH"]
+            print_colored("Select your deployment environment:", "blue")
+            for i, env in enumerate(environments, 1):
+                print(f"{i}. {env}")
+            choice = get_user_input(
+                "Enter the number of your environment:",
+                [str(i) for i in range(1, len(environments) + 1)]
+            )
+            self.environment = environments[int(choice) - 1]
 
     def get_aws_region(self):
         region = os.environ.get('AWS_REGION')
@@ -402,88 +324,31 @@ class HopsworksInstaller:
 
         self.managed_registry_info = {
             "domain": repo_uri.split('/')[0],
-            "namespace": f"hopsworks-{self.cluster_name}"  # Just the base name without /hopsworks-base
+            "namespace": f"hopsworks-{self.cluster_name}"
         }
         print_colored(f"ECR repository set up: {repo_uri}", "green")
 
     def setup_gke_registry(self):
+        """Setup minimal registry with workload identity support"""
         try:
             registry_name = f"hopsworks-{self.cluster_name}"
-
-            # Create the registry
-            registry_cmd = (
-                f"gcloud artifacts repositories create {registry_name} "
-                f"--repository-format=docker "
-                f"--location={self.region} "
-                f"--project={self.project_id}"
-            )
-            create_success, _, create_error = run_command(registry_cmd)
-
-            if not create_success and "already exists" not in str(create_error):
-                print_colored("Failed to create GCP Artifact Registry repository.", "red")
-                return False
-
-            # Important: Add repository-level IAM binding
-            run_command(
-                f"gcloud artifacts repositories add-iam-policy-binding {registry_name} "
-                f"--project={self.project_id} "
-                f"--location={self.region} "
-                f"--member=serviceAccount:hopsworks-{self.cluster_name}@{self.project_id}.iam.gserviceaccount.com "
-                f"--role=roles/artifactregistry.writer"
-            )
-
-            # Modified Docker config
-            docker_config = {
-                "credHelpers": {
-                    f"{self.region}-docker.pkg.dev": "gcloud"
-                },
-                "auths": {
-                    "docker.hops.works": {
-                        "username": "hopsworks",
-                        "password": "hopsworks",
-                        "auth": base64.b64encode(b"hopsworks:hopsworks").decode()
-                    }
-                }
-            }
+            
+            # Just create the repo - auth is handled by workload identity
+            create_cmd = (f"gcloud artifacts repositories create {registry_name} "
+                         f"--repository-format=docker "
+                         f"--location={self.region} "
+                         f"--project={self.project_id}")
+            run_command(create_cmd)
 
             self.managed_registry_info = {
                 "domain": f"{self.region}-docker.pkg.dev",
                 "namespace": f"{self.project_id}/{registry_name}"
             }
-
             return True
 
         except Exception as e:
             print_colored(f"Error during GCP Artifact Registry setup: {str(e)}", "red")
             return False
-
-    def setup_azure_acr(self):
-        cmd = f"az acr list --resource-group {self.resource_group} --query \"[0].name\" -o tsv"
-        success, acr_name, _ = run_command(cmd, verbose=False)
-        if not success or not acr_name:
-            print_colored("No ACR found. Creating a new one...", "yellow")
-            acr_name = f"hopsworks{self.cluster_name.lower()}acr"
-            cmd = f"az acr create --resource-group {self.resource_group} --name {acr_name} --sku Basic"
-            if not run_command(cmd)[0]:
-                print_colored("Failed to create ACR.", "red")
-                return
-
-        cmd = f"az acr show --name {acr_name} --query loginServer -o tsv"
-        success, acr_login_server, _ = run_command(cmd, verbose=False)
-        if not success:
-            print_colored("Failed to get ACR login server.", "red")
-            return
-
-        self.managed_registry_info = {
-            "domain": acr_login_server.strip(),
-            "namespace": "hopsworks"
-        }
-        print_colored(f"ACR set up: {acr_login_server}", "green")
-
-        # Attach ACR to AKS
-        cmd = f"az aks update --name {self.cluster_name} --resource-group {self.resource_group} --attach-acr {acr_name}"
-        if not run_command(cmd)[0]:
-            print_colored("Failed to attach ACR to AKS. You may need to do this manually.", "yellow")
 
     def handle_license_and_user_data(self):
         if not self.args.skip_license:
@@ -525,24 +390,26 @@ class HopsworksInstaller:
             f"--set rondb.clusterSize.activeDataReplicas=1 "
             f"--set hopsworks.service.worker.external.https.type=LoadBalancer "
             f"--set hopsfs.datanode.count=2 "
-            f"--set global._hopsworks.imageRegistry=docker.hops.works "  # Keep base images from docker.hops.works
+            f"--set global._hopsworks.imageRegistry=docker.hops.works " 
         )
 
         # Cloud-specific configurations
         if self.environment == "GCP":
             registry_name = f"hopsworks-{self.cluster_name}"
-            helm_command = (
-                f"helm upgrade --install hopsworks-release hopsworks/hopsworks "
-                f"--namespace={self.namespace} "
-                f"--create-namespace "
-                f"--set global._hopsworks.cloudProvider=GCP "
-                f"--set global._hopsworks.managedDockerRegistery.enabled=true "
-                f"--set global._hopsworks.managedDockerRegistery.domain={self.region}-docker.pkg.dev "
-                f"--set global._hopsworks.managedDockerRegistery.namespace={self.project_id}/{registry_name} "
-                f"--set global._hopsworks.managedDockerRegistery.credHelper.enabled=true "
-                f"--set global._hopsworks.managedDockerRegistery.credHelper.secretName=gcrregcred "
-                f"--timeout 60m --wait --devel"
+            helm_command += (
+                f" --set global._hopsworks.cloudProvider=GCP"
+                f" --set global._hopsworks.managedDockerRegistery.enabled=true"
+                f" --set global._hopsworks.managedDockerRegistery.domain={self.region}-docker.pkg.dev"
+                f" --set global._hopsworks.managedDockerRegistery.namespace={self.project_id}/{registry_name}"
+                f" --set global._hopsworks.managedDockerRegistery.credHelper.enabled=true"
+                f" --set global._hopsworks.managedDockerRegistery.credHelper.secretName=gcrregcred"
+                f" --set hopsworks.variables.docker_operations_managed_docker_secrets=gcrregcred"
+                f" --set hopsworks.variables.docker_operations_image_pull_secrets=gcrregcred"
+                f" --set hopsworks.dockerRegistry.preset.secrets[0]=gcrregcred"
+                f" --set serviceAccount.name=hopsworks-sa"  # Use our created SA
+                f" --set serviceAccount.annotations.\"iam\\.gke\\.io/gcp-service-account\"={self.sa_email}"
             )
+            
         elif self.environment == "AWS":
             helm_command += (
                 f" --set global._hopsworks.cloudProvider=AWS"
@@ -566,7 +433,7 @@ class HopsworksInstaller:
             )
         else:  # OVH or others
             helm_command += f" --set global._hopsworks.cloudProvider={self.environment}"
-
+            
         helm_command += " --timeout 60m --wait --devel"
 
         print_colored("Starting Hopsworks installation...", "cyan")
@@ -607,7 +474,10 @@ class HopsworksInstaller:
             print_colored("\nHealth check failed. Please review the installation and check the logs.", "red")
 
         print_colored("\nInstallation completed!", "green")
-        print_colored(f"Your installation ID is: {self.installation_id}", "green")
+        if hasattr(self, 'installation_id') and self.installation_id:
+            print_colored(f"Your installation ID is: {self.installation_id}", "green")
+        else:
+            print_colored("Installation ID not available.", "yellow")
         print_colored(
             "Note: It may take a few minutes for all services to become fully operational.",
             "yellow"
@@ -639,7 +509,7 @@ class HopsworksInstaller:
             cmd = f"kubectl get svc -n {self.namespace} -o jsonpath='{{range .items}}{{if eq .spec.type \"LoadBalancer\"}}{{.metadata.name}}{{\"=\"}}{{.status.loadBalancer.ingress[0].ip}}{{\"\\n\"}}{{end}}{{end}}'"
             success, output, _ = run_command(cmd, verbose=False)
             if success and output.strip():
-                services = dict(line.split('=') for line in output.strip().split('\n'))
+                services = dict(line.split('=') for line in output.strip().split('\n') if '=' in line)
                 if 'hopsworks-release' in services:
                     return services['hopsworks-release']
                 else:
@@ -651,6 +521,13 @@ class HopsworksInstaller:
                 print_colored("Failed to retrieve any LoadBalancer addresses. Please check your service configuration.", "yellow")
                 return None
 
+    def verify_workload_identity(self):
+        cmd = f"gcloud container clusters describe {self.cluster_name} --zone {self.zone} --format='value(workloadIdentityConfig.workloadPool)'"
+        success, output, _ = run_command(cmd)
+        if not success or f"{self.project_id}.svc.id.goog" not in output:
+            print_colored("Workload Identity not properly configured!", "red")
+            return False
+        return True
 
 def print_colored(message, color, **kwargs):
     colors = {
@@ -779,7 +656,7 @@ def wait_for_pods_ready(namespace, timeout=600, readiness_threshold=0.7):
                     if any(critical in pod['metadata']['name'] for critical in critical_pods):
                         critical_ready += 1
 
-            readiness_ratio = ready_pods / total_pods
+            readiness_ratio = ready_pods / total_pods if total_pods > 0 else 0
             print_colored(f"\rPods ready: {ready_pods}/{total_pods} ({readiness_ratio:.2%})", "cyan", end='')
 
             if readiness_ratio >= readiness_threshold and critical_ready == len(critical_pods):
@@ -790,12 +667,6 @@ def wait_for_pods_ready(namespace, timeout=600, readiness_threshold=0.7):
         else:
             print_colored("\nFailed to get pod status. Retrying...", "yellow")
             time.sleep(5)
-
-        if time.time() - start_time > 30:  # 5 minutes passed
-            proceed = get_user_input("\nMost of the pods are ready! Proceed? (yes/no): ", ["yes", "no"])
-            if proceed.lower() == "yes":
-                print_colored("Proceeding with installation...", "yellow")
-                return True
 
     print_colored("\nTimed out waiting for pods to be ready.", "red")
     return False
