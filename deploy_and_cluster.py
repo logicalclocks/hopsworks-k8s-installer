@@ -50,15 +50,17 @@ class HopsworksInstaller:
     def run(self):
         print_colored(HOPSWORKS_LOGO, "white")
         self.parse_arguments()
-        self.check_required_tools()
         self.get_deployment_environment()
+        self.check_required_tools()
 
+        if self.environment == "GCP":
+            self.setup_gke_prerequisites()
+        else:
+            self.setup_and_verify_kubeconfig()
+
+        self.handle_managed_registry()
+        # Proceed with the rest of the flow
         if not self.args.loadbalancer_only:
-            if self.environment == "GCP":
-                self.setup_gke_prerequisites()
-            else:
-                self.setup_and_verify_kubeconfig()
-            self.handle_managed_registry()
             self.handle_license_and_user_data()
             if self.install_hopsworks():
                 print_colored("\nHopsworks installation completed.", "green")
@@ -67,9 +69,6 @@ class HopsworksInstaller:
                 print_colored("Hopsworks installation failed. Please check the logs and try again.", "red")
                 sys.exit(1)
         else:
-            # For loadbalancer-only, we need to set up the necessary variables
-            self.namespace = self.args.namespace
-            self.setup_and_verify_kubeconfig()
             self.finalize_installation()
 
     def setup_gke_prerequisites(self):
@@ -163,9 +162,9 @@ class HopsworksInstaller:
         else:
             print_colored(f"Role '{self.role_name}' bound to service account '{self.sa_email}'.", "green")
 
-        # 5. NOW we can create the cluster with the service account
-        self.cluster_name = input("Enter your GKE cluster name: ").strip() or "hopsworks-cluster"
-        node_count = input("Enter number of nodes (default: 6): ").strip() or "6"
+        # 5. Now we can create the cluster with the service account
+        self.cluster_name = input("Enter your GKE cluster name: ").strip() or "Hopsworks-cluster"
+        node_count = input("Enter number of nodes (default: 4): ").strip() or "4"
         machine_type = input("Enter machine type (default: n2-standard-8): ").strip() or "n2-standard-8"
 
         cluster_cmd = (f"gcloud container clusters create {self.cluster_name} "
@@ -174,7 +173,6 @@ class HopsworksInstaller:
                        f"--num-nodes={node_count} "
                        f"--enable-ip-alias "
                        f"--service-account={self.sa_email}")
-        
         print_colored("Creating GKE cluster...", "cyan")
         if not run_command(cluster_cmd)[0]:
             print_colored("Failed to create GKE cluster.", "red")
@@ -205,31 +203,12 @@ class HopsworksInstaller:
         self.setup_gke_authentication()
 
     def setup_gke_authentication(self):
-        """Setup GKE auth with proper Workload Identity"""
-        # 1. Create and bind Kubernetes service account
-        print_colored("Setting up Kubernetes service account...", "cyan")
-        run_command(f"kubectl create namespace {self.namespace} --dry-run=client -o yaml | kubectl apply -f -")
-        run_command(f"kubectl create serviceaccount -n {self.namespace} hopsworks-sa")
-        
-        # Bind the GCP SA to K8s SA
-        workload_binding = (
-            f"gcloud iam service-accounts add-iam-policy-binding {self.sa_email} "
-            f"--role roles/iam.workloadIdentityUser "
-            f"--member \"serviceAccount:{self.project_id}.svc.id.goog[{self.namespace}/hopsworks-sa]\""
-        )
-        run_command(workload_binding)
-
-        # Annotate the K8s SA
-        run_command(
-            f"kubectl annotate serviceaccount -n {self.namespace} hopsworks-sa "
-            f"iam.gke.io/gcp-service-account={self.sa_email}"
-        )
-
-        # 2. Setup Docker config for both GCP and hops.works registries
+        """Setup docker auth config for GKE"""
+        print_colored("Setting up GKE authentication...", "cyan")
+        # Simple Docker config for GCR
         docker_config = {
             "credHelpers": {
-                f"{self.region}-docker.pkg.dev": "gcloud",
-                "docker.hops.works": "gcloud"
+                f"{self.region}-docker.pkg.dev": "gcloud"
             }
         }
 
@@ -237,10 +216,10 @@ class HopsworksInstaller:
             json.dump(docker_config, f)
             config_file = f.name
 
-        run_command(f"kubectl create configmap docker-config -n {self.namespace} "
-                   f"--from-file=config.json={config_file} "
-                   f"--dry-run=client -o yaml | kubectl apply -f -")
-        
+        run_command(f"kubectl create namespace {self.namespace} --dry-run=client -o yaml | kubectl apply -f -")
+        run_command(f"kubectl delete configmap docker-config -n {self.namespace} --ignore-not-found")
+        run_command(f"kubectl create configmap docker-config -n {self.namespace} --from-file=config.json={config_file}")
+
         os.unlink(config_file)
         return True
 
@@ -276,23 +255,10 @@ class HopsworksInstaller:
             kubeconfig_path = os.path.expanduser("~/.kube/config")
 
         elif self.environment == "GCP":
-            if self.args.loadbalancer_only:
-                cluster_name = input("Enter your GKE cluster name: ").strip()
-                self.project_id = input("Enter your GCP project ID: ").strip()
-                zone_input = input("Enter your GCP zone (e.g. europe-west1-b): ").strip()
-                self.zone = zone_input
-                self.region = '-'.join(zone_input.split('-')[:-1])  # extract region from zone
-            else:
-                # Since we handle GCP kubeconfig in setup_gke_prerequisites, skip here
-                cluster_name = self.cluster_name
-
-            cmd = f"gcloud container clusters get-credentials {cluster_name} --project {self.project_id} --zone {self.zone}"
-            if not run_command(cmd)[0]:
-                print_colored("Failed to get GKE credentials. Check your gcloud setup.", "red")
-                return None, None, None
-
-            run_command("gcloud auth configure-docker", verbose=False)
+            # Since we handle GCP kubeconfig in setup_gke_prerequisites, skip here
             kubeconfig_path = os.path.expanduser("~/.kube/config")
+            cluster_name = self.cluster_name
+            region = self.region
 
         elif self.environment == "Azure":
             self.resource_group = input("Enter your Azure resource group name: ").strip()
@@ -480,8 +446,6 @@ class HopsworksInstaller:
                 f" --set hopsworks.variables.docker_operations_managed_docker_secrets=gcrregcred"
                 f" --set hopsworks.variables.docker_operations_image_pull_secrets=gcrregcred"
                 f" --set hopsworks.dockerRegistry.preset.secrets[0]=gcrregcred"
-                f" --set serviceAccount.name=hopsworks-sa"  # Use our created SA
-                f" --set serviceAccount.annotations.\"iam\\.gke\\.io/gcp-service-account\"={self.sa_email}"
             )
 
         elif self.environment == "AWS":
@@ -548,10 +512,7 @@ class HopsworksInstaller:
             print_colored("\nHealth check failed. Please review the installation and check the logs.", "red")
 
         print_colored("\nInstallation completed!", "green")
-        if hasattr(self, 'installation_id') and self.installation_id:
-            print_colored(f"Your installation ID is: {self.installation_id}", "green")
-        else:
-            print_colored("Installation ID not available.", "yellow")
+        print_colored(f"Your installation ID is: {self.installation_id}", "green")
         print_colored(
             "Note: It may take a few minutes for all services to become fully operational.",
             "yellow"
@@ -583,7 +544,7 @@ class HopsworksInstaller:
             cmd = f"kubectl get svc -n {self.namespace} -o jsonpath='{{range .items}}{{if eq .spec.type \"LoadBalancer\"}}{{.metadata.name}}{{\"=\"}}{{.status.loadBalancer.ingress[0].ip}}{{\"\\n\"}}{{end}}{{end}}'"
             success, output, _ = run_command(cmd, verbose=False)
             if success and output.strip():
-                services = dict(line.split('=') for line in output.strip().split('\n') if '=' in line)
+                services = dict(line.split('=') for line in output.strip().split('\n'))
                 if 'hopsworks-release' in services:
                     return services['hopsworks-release']
                 else:
@@ -595,6 +556,7 @@ class HopsworksInstaller:
                 print_colored("Failed to retrieve any LoadBalancer addresses. Please check your service configuration.", "yellow")
                 return None
 
+
 def print_colored(message, color, **kwargs):
     colors = {
         "red": "\033[91m", "green": "\033[92m", "yellow": "\033[93m",
@@ -602,6 +564,7 @@ def print_colored(message, color, **kwargs):
         "white": "\033[97m", "reset": "\033[0m"
     }
     print(f"{colors.get(color, '')}{message}{colors['reset']}", **kwargs)
+
 
 def run_command(command, verbose=True):
     if verbose:
@@ -619,12 +582,14 @@ def run_command(command, verbose=True):
     except Exception as e:
         return False, "", str(e)
 
+
 def get_user_input(prompt, options=None):
     while True:
         response = input(prompt + " ").strip()
         if options is None or response.lower() in [option.lower() for option in options]:
             return response
         print_colored(f"Invalid input. Expected one of: {', '.join(options)}", "yellow")
+
 
 def periodic_status_update(stop_event, namespace):
     while not stop_event.is_set():
@@ -641,6 +606,7 @@ def periodic_status_update(stop_event, namespace):
         sys.stdout.flush()  # Ensure the output is displayed immediately
         time.sleep(10)  # Update every 10 seconds
     print()  # Print a newline when done to move to the next line
+
 
 def get_license_agreement():
     print_colored("\nChoose a license agreement:", "blue")
@@ -659,9 +625,11 @@ def get_license_agreement():
         sys.exit(1)
     return license_type, agreement
 
+
 def get_user_info():
     print_colored("\nProvide the following information:", "blue")
     return input("Your name: "), input("Your email address: "), input("Your company name: ")
+
 
 def send_user_data(name, email, company, license_type, agreed_to_license):
     print_colored("\nSending user data...", "blue")
@@ -692,6 +660,7 @@ def send_user_data(name, email, company, license_type, agreed_to_license):
     except (urllib.error.URLError, urllib.error.HTTPError) as e:
         print_colored(f"Failed to send user data: {str(e)}", "red")
         return False, installation_id
+
 
 def wait_for_pods_ready(namespace, timeout=600, readiness_threshold=0.7):
     print_colored("Checking pod readiness...", "yellow")
@@ -730,6 +699,7 @@ def wait_for_pods_ready(namespace, timeout=600, readiness_threshold=0.7):
     print_colored("\nTimed out waiting for pods to be ready.", "red")
     return False
 
+
 def health_check(namespace):
     print_colored("\nPerforming basic health check...", "blue")
 
@@ -741,6 +711,7 @@ def health_check(namespace):
 
     print_colored("Basic health check passed.", "green")
     return True
+
 
 if __name__ == "__main__":
     installer = HopsworksInstaller()
