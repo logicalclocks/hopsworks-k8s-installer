@@ -7,7 +7,7 @@
 DEFAULT_PROJECT_ID="lexkube"
 DEFAULT_ZONE="europe-west1-b"
 DEFAULT_REGION="europe-west1"
-DEFAULT_CLUSTER_NAME="lex1"
+DEFAULT_CLUSTER_NAME="googlex"
 
 # Accepting inputs with defaults
 PROJECT_ID="${1:-$DEFAULT_PROJECT_ID}"

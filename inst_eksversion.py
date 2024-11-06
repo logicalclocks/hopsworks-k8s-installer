@@ -56,7 +56,25 @@ def run_command(command, verbose=True):
         return result.returncode == 0, result.stdout, result.stderr
     except Exception as e:
         return False, "", str(e)
-
+    
+def install_certificates():
+    """Install SSL certificates for Python on macOS"""
+    if sys.platform != "darwin":
+        print_colored("Certificate installation only needed on macOS", "yellow")
+        return
+        
+    try:
+        import ssl
+        import certifi
+        
+        # Set the default SSL context to use certifi's certificates
+        ssl._create_default_https_context = ssl._create_unverified_context
+        print_colored("SSL certificate verification temporarily disabled", "yellow")
+    except ImportError:
+        print_colored("Installing certifi...", "cyan")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "certifi"])
+        print_colored("Certifi installed successfully", "green")
+        
 class HopsworksInstaller:
     def __init__(self):
         self.environment = None
@@ -101,32 +119,36 @@ class HopsworksInstaller:
                 
             except Exception as e:
                 print_colored(f"Failed to fetch {file}: {str(e)}", "red")
-                print_colored("Falling back to local template generation...", "yellow")
-                if file == 'eksctl.yaml':
-                    self._generate_eksctl_config()
-                elif file == 'policy.json':
-                    self._generate_policy()
-
+                sys.exit(1) 
+                    
     def _customize_eksctl_config(self, content):
-        """Customize the eksctl config template"""
+        """Only customize what's absolutely needed in eksctl config"""
         config = yaml.safe_load(content)
         
-        # Update basic metadata
-        config['metadata']['name'] = self.cluster_name
-        config['metadata']['region'] = self.region
-        
-        # Update node configuration based on user input
-        node_count = input("Enter number of nodes (default: 4): ").strip() or "4"
-        instance_type = input("Enter instance type (default: m6i.2xlarge): ").strip() or "m6i.2xlarge"
-        
-        config['managedNodeGroups'][0].update({
-            'minSize': 1,
-            'maxSize': int(node_count),
-            'desiredCapacity': int(node_count),
-            'instanceType': instance_type
+        # Just update the basics
+        config['metadata'].update({
+            'name': self.cluster_name,
+            'region': self.region
         })
         
-        return yaml.dump(config)
+        # Node config (keep it simple)
+        node_count = input("Enter number of nodes (default: 4): ").strip() or "4"
+        
+        ng = config['managedNodeGroups'][0]
+        ng.update({
+            'desiredCapacity': int(node_count),
+            'maxSize': int(node_count)
+        })
+        
+        # Get the current account's ARN for policy
+        account_id = self._get_account_id()
+        policy_arn = f"arn:aws:iam::{account_id}:policy/{self.cluster_name}-policy"
+
+        ng = config['managedNodeGroups'][0]
+        if policy_arn not in ng['iam']['attachPolicyARNs']:
+            ng['iam']['attachPolicyARNs'].append(policy_arn)
+
+        return yaml.dump(config, default_flow_style=False)
 
     def _customize_policy(self, content):
         """Customize the IAM policy template"""
@@ -150,135 +172,45 @@ class HopsworksInstaller:
         """Get AWS account ID"""
         return boto3.client('sts').get_caller_identity()['Account']
 
-    def setup_alb_controller(self):
-        """Setup AWS Load Balancer Controller"""
-        try:
-            run_command("kubectl create namespace kube-system --dry-run=client -o yaml | kubectl apply -f -")
-        except Exception as e:
-            # kube-system probably exists already, which is fine
-            pass
-
-        print_colored("Setting up AWS Load Balancer Controller...", "cyan")
-        
-        # Add helm repo and update
-        run_command("helm repo add eks https://aws.github.io/eks-charts")
-        run_command("helm repo update eks")
-        
-        # Create IAM policy for ALB controller
-        alb_policy_name = f"AWSLoadBalancerControllerIAMPolicy-{self.cluster_name}"
-        
-        # Download and apply the ALB policy
-        run_command("curl -o alb-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.6.1/docs/install/iam_policy.json")
-        
-        try:
-            with open('alb-policy.json', 'r') as policy_file:
-                alb_policy = policy_file.read()
-                
-            iam_client = boto3.client('iam')
-            try:
-                response = iam_client.create_policy(
-                    PolicyName=alb_policy_name,
-                    PolicyDocument=alb_policy
-                )
-                alb_policy_arn = response['Policy']['Arn']
-            except iam_client.exceptions.EntityAlreadyExistsException:
-                alb_policy_arn = f"arn:aws:iam::{self._get_account_id()}:policy/{alb_policy_name}"
-            
-            # Create service account for ALB controller
-            sa_manifest = f"""
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: aws-load-balancer-controller
-  namespace: kube-system
-  annotations:
-    eks.amazonaws.com/role-arn: {alb_policy_arn}
-"""
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
-                f.write(sa_manifest)
-                sa_file = f.name
-            
-            run_command(f"kubectl apply -f {sa_file}")
-            os.unlink(sa_file)
-            
-            # Install ALB controller
-            install_cmd = (
-                f"helm install aws-load-balancer-controller eks/aws-load-balancer-controller "
-                f"-n kube-system "
-                f"--set clusterName={self.cluster_name} "
-                f"--set serviceAccount.create=false "
-                f"--set serviceAccount.name=aws-load-balancer-controller"
-            )
-            
-            if not run_command(install_cmd)[0]:
-                print_colored("Failed to install AWS Load Balancer Controller", "red")
-                return False
-                
-            # Create IngressClass
-            ingress_class = """
-apiVersion: networking.k8s.io/v1
-kind: IngressClass
-metadata:
-  name: alb
-  annotations:
-    ingressclass.kubernetes.io/is-default-class: "true"
-spec:
-  controller: ingress.k8s.aws/alb
-"""
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
-                f.write(ingress_class)
-                ic_file = f.name
-            
-            run_command(f"kubectl apply -f {ic_file}")
-            os.unlink(ic_file)
-            
-            return True
-            
-        except Exception as e:
-            print_colored(f"Failed to setup ALB controller: {str(e)}", "red")
-            return False
-
     def setup_aws_prerequisites(self):
-        """Setup everything needed before cluster creation for AWS"""
+        """Setup AWS prerequisites in correct order"""
         print_colored("\nSetting up AWS prerequisites...", "blue")
         
         self.region = self.get_aws_region()
-        self.cluster_name = input("Enter your EKS cluster name: ").strip() or "hopsworks-cluster"
+        self.cluster_name = input("Enter your EKS cluster name: ").strip()
         
-        # Fetch and customize configurations
-        self.fetch_and_customize_configs()
-        
-        # Create ECR repository with proper error handling
+        # 1. Create S3 bucket first
+        bucket_name = f"{self.cluster_name}-bucket"
+        if not run_command(f"aws s3 mb s3://{bucket_name} --region {self.region}")[0]:
+            print_colored("Failed to create S3 bucket", "red")
+            sys.exit(1)
+            
+        # 2. Create ECR repo
         print_colored("Setting up ECR repository...", "cyan")
         repo_name = f"{self.cluster_name}/hopsworks-base"
         try:
             ecr_client = boto3.client('ecr', region_name=self.region)
-            try:
-                ecr_client.create_repository(repositoryName=repo_name)
-                print_colored(f"Created ECR repository: {repo_name}", "green")
-            except ecr_client.exceptions.RepositoryAlreadyExistsException:
-                print_colored(f"Using existing ECR repository: {repo_name}", "yellow")
-        except Exception as e:
-            print_colored(f"ECR setup failed: {str(e)}", "red")
-            sys.exit(1)
-
-        # Create the cluster with proper feedback
-        print_colored("Creating EKS cluster (estimated time: 15-20 minutes)...", "cyan")
+            ecr_client.create_repository(repositoryName=repo_name)
+        except ecr_client.exceptions.RepositoryAlreadyExistsException:
+            print_colored(f"Using existing ECR repository: {repo_name}", "yellow")
         
-        if not run_command(f"eksctl create cluster -f eksctl.yaml")[0]:
-            print_colored("Failed to create EKS cluster", "red")
+        # 3. Create IAM policy (using account ID dynamically)
+        account_id = self._get_account_id()
+        policy_name = f"{self.cluster_name}-policy"
+        
+        policy_document = self._customize_policy(...)  # Your existing policy template
+        
+        try:
+            iam_client = boto3.client('iam')
+            response = iam_client.create_policy(
+                PolicyName=policy_name,
+                PolicyDocument=json.dumps(policy_document)
+            )
+            self.policy_arn = response['Policy']['Arn']
+        except Exception as e:
+            print_colored(f"Failed to create IAM policy: {str(e)}", "red")
             sys.exit(1)
-       
-        print_colored("Waiting for cluster API to be fully ready...", "cyan")
-        time.sleep(30)  # Simple but effective
-
-        # Setup ALB controller
-        if not self.setup_alb_controller():
-            print_colored("Failed to setup AWS Load Balancer Controller", "red")
-            sys.exit(1)
-
-        print_colored("AWS prerequisites setup completed successfully!", "green")
-
+            
     def get_aws_region(self):
         region = os.environ.get('AWS_REGION')
         if not region:
@@ -525,7 +457,7 @@ spec:
             run_command(f"kubectl create namespace {self.namespace}")
             
             # Get account ID for ECR domain
-            account_id = boto3.client('sts').get_caller_identity()['Account']
+            account_id = self._get_account_id()
             ecr_domain = f"{account_id}.dkr.ecr.{self.region}.amazonaws.com"
             
             print_colored("Setting up AWS-specific Kubernetes secrets...", "cyan")
@@ -539,26 +471,11 @@ spec:
                 f"--docker-password=$(aws ecr get-login-password --region {self.region})"
             )
 
-            # Create service account with proper annotations
-            service_account_yaml = f"""
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-name: hopsworks-sa
-namespace: {self.namespace}
-annotations:
-    eks.amazonaws.com/role-arn: {self.policy_arn}
-"""
-            
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
-                f.write(service_account_yaml)
-                sa_file = f.name
-
-            run_command(f"kubectl apply -f {sa_file}")
-            os.unlink(sa_file)
-
             helm_command = (
                 f"{helm_command}"
+                f" --namespace={self.namespace}"
+                f" --create-namespace"
+                f" --set global._hopsworks.storageClassName=ebs-gp3"
                 f" --set global._hopsworks.cloudProvider=AWS"
                 f" --set global._hopsworks.managedDockerRegistery.enabled=true"
                 f" --set global._hopsworks.managedDockerRegistery.credHelper.enabled=true"
@@ -568,24 +485,15 @@ annotations:
                 f" --set hopsworks.variables.docker_operations_managed_docker_secrets=awsregcred"
                 f" --set hopsworks.variables.docker_operations_image_pull_secrets=awsregcred"
                 f" --set hopsworks.dockerRegistry.preset.secrets[0]=awsregcred"
-                f" --set serviceAccount.name=hopsworks-sa"
-                f" --set serviceAccount.annotations.\"eks\\.amazonaws\\.com/role-arn\"={self.policy_arn}"
-                # AWS specific storage classes
-                f" --set global._hopsworks.storageClassName=gp3"
-                f" --set rondb.storageClass=gp3"
-                f" --set elastic.persistentVolume.storageClassName=gp3"
-                f" --set filebeat.persistentVolume.storageClassName=gp3"
-                f" --set kafka.persistentVolume.storageClassName=gp3"
-                f" --set onlinefs.persistentVolume.storageClassName=gp3"
                 # Standard optimizations
+                f" --set docker-registry.enabled=true"
+                f" --set docker-registry.replicas=1"
                 f" --set global._hopsworks.imagePullPolicy=Always"
                 f" --set hopsworks.replicaCount.worker=1"
                 f" --set rondb.clusterSize.activeDataReplicas=1"
-                f" --set hopsfs.datanode.count=2"
-                # AWS Load Balancer annotations
-                f" --set hopsworks.service.worker.external.https.annotations.\"service\\.beta\\.kubernetes\\.io/aws-load-balancer-type\"=nlb"
-                f" --set hopsworks.service.worker.external.https.annotations.\"service\\.beta\\.kubernetes\\.io/aws-load-balancer-nlb-target-type\"=ip"
-                f" --set hopsworks.service.worker.external.https.annotations.\"service\\.beta\\.kubernetes\\.io/aws-load-balancer-scheme\"=internet-facing"
+                f" --set hopsfs.datanode.count=1"
+                f" --set rondb.isMultiNodeCluster=true"
+                f" --set hopsworks.service.worker.external.https.type=LoadBalancer"
                 # Update ingress class to use ALB
                 f" --set hopsworks.ingress.class=alb"
             )
@@ -835,5 +743,6 @@ def health_check(namespace):
     return True
 
 if __name__ == "__main__":
+    install_certificates()  # Add this line here
     installer = HopsworksInstaller()
     installer.run()

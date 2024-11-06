@@ -533,7 +533,7 @@ class HopsworksInstaller:
             )
 
         # Add timeout for all installations
-        helm_command += " --timeout 60m --wait --devel"
+        helm_command += " --timeout 60m --devel"
 
         print_colored("Starting Hopsworks installation...", "cyan")
         
