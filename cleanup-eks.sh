@@ -4,8 +4,8 @@
 # ./cleanup-eks.sh "your cluster name" "your region" "profile (optional)"
 
 # Default values
-DEFAULT_CLUSTER_NAME="lexcluster"
-DEFAULT_REGION="eu-west-2"
+DEFAULT_CLUSTER_NAME="le-eks"
+DEFAULT_REGION="eu-west-1"
 PROFILE="${3:-default}"
 
 # Accepting inputs with defaults

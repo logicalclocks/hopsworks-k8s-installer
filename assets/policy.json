@@ -19,8 +19,8 @@
         "S3:DeleteObjectVersion"
       ],
       "Resource": [
-        "arn:aws:s3:::l3xbucket/*",
-        "arn:aws:s3:::l3xbucket"
+        "arn:aws:s3:::YOURBUCKET/*",
+        "arn:aws:s3:::YOURBUCKET"
       ]
     },
     {

@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import subprocess
 import time
 import sys
@@ -17,7 +15,6 @@ import base64
 import json
 import tempfile
 import yaml
-from botocore.exceptions import ClientError
 
 HOPSWORKS_LOGO = """
 ██╗  ██╗    ██████╗    ██████╗    ███████╗   ██╗    ██╗    ██████╗    ██████╗    ██╗  ██╗   ███████╗
@@ -33,6 +30,26 @@ STARTUP_LICENSE_URL = "https://www.hopsworks.ai/startup-license"
 EVALUATION_LICENSE_URL = "https://www.hopsworks.ai/evaluation-license"
 INSTALL_RAW = "https://raw.githubusercontent.com/MagicLex/hopsworks-k8s-installer/refs/heads/master/assets"
 
+
+# Utilities 
+def install_certificates():
+    """Install SSL certificates for Python on macOS"""
+    if sys.platform != "darwin":
+        print_colored("Certificate installation only needed on macOS", "yellow")
+        return
+        
+    try:
+        import ssl
+        import certifi
+        
+        # Set the default SSL context to use certifi's certificates
+        ssl._create_default_https_context = ssl._create_unverified_context
+        print_colored("SSL certificate verification temporarily disabled", "yellow")
+    except ImportError:
+        print_colored("Installing certifi...", "cyan")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "certifi"])
+        print_colored("Certifi installed successfully", "green")
+        
 def print_colored(message, color, **kwargs):
     colors = {
         "red": "\033[91m", "green": "\033[92m", "yellow": "\033[93m",
@@ -56,183 +73,57 @@ def run_command(command, verbose=True):
         return result.returncode == 0, result.stdout, result.stderr
     except Exception as e:
         return False, "", str(e)
-    
-def install_certificates():
-    """Install SSL certificates for Python on macOS"""
-    if sys.platform != "darwin":
-        print_colored("Certificate installation only needed on macOS", "yellow")
-        return
-        
-    try:
-        import ssl
-        import certifi
-        
-        # Set the default SSL context to use certifi's certificates
-        ssl._create_default_https_context = ssl._create_unverified_context
-        print_colored("SSL certificate verification temporarily disabled", "yellow")
-    except ImportError:
-        print_colored("Installing certifi...", "cyan")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "certifi"])
-        print_colored("Certifi installed successfully", "green")
-        
+
+def get_user_input(prompt, options=None):
+    while True:
+        response = input(prompt + " ").strip()
+        if options is None or response.lower() in [option.lower() for option in options]:
+            return response
+        print_colored(f"Invalid input. Expected one of: {', '.join(options)}", "yellow")
+
+# Main installer
 class HopsworksInstaller:
     def __init__(self):
-        self.environment = None
-        self.kubeconfig_path = None
-        self.cluster_name = None
-        self.region = None
-        self.zone = None
-        self.namespace = 'hopsworks'
-        self.installation_id = None
-        self.args = None
-        self.project_id = None  # for GCP
-        self.policy_arn = None  # for AWS
-        self.use_managed_registry = False
-        self.managed_registry_info = None
-        self.sa_email = None    # for GCP
-        self.role_name = None   # for GCP
-
-    def fetch_and_customize_configs(self):
-        """Fetch and customize eksctl and IAM policy configurations"""
-        print_colored("Fetching configuration templates...", "cyan")
-        
-        configs = {
-            'eksctl.yaml': '/eksctl.yaml',
-            'policy.json': '/policy.json'
-        }
-        
-        for file, remote_path in configs.items():
-            try:
-                url = f"{INSTALL_RAW}{remote_path}"
-                response = urllib.request.urlopen(url)
-                content = response.read().decode('utf-8')
-                
-                if file == 'eksctl.yaml':
-                    content = self._customize_eksctl_config(content)
-                elif file == 'policy.json':
-                    content = self._customize_policy(content)
-                    
-                with open(file, 'w') as f:
-                    f.write(content)
-                    
-                print_colored(f"Successfully customized {file}", "green")
-                
-            except Exception as e:
-                print_colored(f"Failed to fetch {file}: {str(e)}", "red")
-                sys.exit(1) 
-                    
-    def _customize_eksctl_config(self, content):
-        """Only customize what's absolutely needed in eksctl config"""
-        config = yaml.safe_load(content)
-        
-        # Just update the basics
-        config['metadata'].update({
-            'name': self.cluster_name,
-            'region': self.region
-        })
-        
-        # Node config (keep it simple)
-        node_count = input("Enter number of nodes (default: 4): ").strip() or "4"
-        
-        ng = config['managedNodeGroups'][0]
-        ng.update({
-            'desiredCapacity': int(node_count),
-            'maxSize': int(node_count)
-        })
-        
-        # Get the current account's ARN for policy
-        account_id = self._get_account_id()
-        policy_arn = f"arn:aws:iam::{account_id}:policy/{self.cluster_name}-policy"
-
-        ng = config['managedNodeGroups'][0]
-        if policy_arn not in ng['iam']['attachPolicyARNs']:
-            ng['iam']['attachPolicyARNs'].append(policy_arn)
-
-        return yaml.dump(config, default_flow_style=False)
-
-    def _customize_policy(self, content):
-        """Customize the IAM policy template"""
-        policy = json.loads(content)
-        
-        # Update S3 bucket resources
-        for statement in policy['Statement']:
-            if statement.get('Sid') == 'hopsworksaiInstanceProfile':
-                statement['Resource'] = [
-                    f"arn:aws:s3:::{self.cluster_name}-bucket/*",
-                    f"arn:aws:s3:::{self.cluster_name}-bucket"
-                ]
-            elif statement.get('Sid') == 'AllowPushandPullImagesToUserRepo':
-                statement['Resource'] = [
-                    f"arn:aws:ecr:{self.region}:{self._get_account_id()}:repository/*/hopsworks-base"
-                ]
-        
-        return json.dumps(policy, indent=2)
-
-    def _get_account_id(self):
-        """Get AWS account ID"""
-        return boto3.client('sts').get_caller_identity()['Account']
-
-    def setup_aws_prerequisites(self):
-        """Setup AWS prerequisites in correct order"""
-        print_colored("\nSetting up AWS prerequisites...", "blue")
-        
-        self.region = self.get_aws_region()
-        self.cluster_name = input("Enter your EKS cluster name: ").strip()
-        
-        # 1. Create S3 bucket first
-        bucket_name = f"{self.cluster_name}-bucket"
-        if not run_command(f"aws s3 mb s3://{bucket_name} --region {self.region}")[0]:
-            print_colored("Failed to create S3 bucket", "red")
-            sys.exit(1)
+            # Common attributes
+            self.environment = None
+            self.kubeconfig_path = None
+            self.cluster_name = None
+            self.region = None
+            self.zone = None
+            self.namespace = 'hopsworks'
+            self.installation_id = None
+            self.args = None
             
-        # 2. Create ECR repo
-        print_colored("Setting up ECR repository...", "cyan")
-        repo_name = f"{self.cluster_name}/hopsworks-base"
-        try:
-            ecr_client = boto3.client('ecr', region_name=self.region)
-            ecr_client.create_repository(repositoryName=repo_name)
-        except ecr_client.exceptions.RepositoryAlreadyExistsException:
-            print_colored(f"Using existing ECR repository: {repo_name}", "yellow")
-        
-        # 3. Create IAM policy (using account ID dynamically)
-        account_id = self._get_account_id()
-        policy_name = f"{self.cluster_name}-policy"
-        
-        policy_document = self._customize_policy(...)  # Your existing policy template
-        
-        try:
-            iam_client = boto3.client('iam')
-            response = iam_client.create_policy(
-                PolicyName=policy_name,
-                PolicyDocument=json.dumps(policy_document)
-            )
-            self.policy_arn = response['Policy']['Arn']
-        except Exception as e:
-            print_colored(f"Failed to create IAM policy: {str(e)}", "red")
-            sys.exit(1)
+            # GCP specific
+            self.project_id = None
+            self.sa_email = None
+            self.role_name = None
             
-    def get_aws_region(self):
-        region = os.environ.get('AWS_REGION')
-        if not region:
-            region = input("Enter your AWS region (e.g., us-east-2): ").strip()
-            os.environ['AWS_REGION'] = region
-        return region
+            # Registry handling
+            self.use_managed_registry = False
+            self.managed_registry_info = None
+            
+            # AWS specific
+            self.aws_profile = None
+            self.aws_account_id = None
+            self.policy_name = None
+            
+            # Azure specific (if we need it later)
+            self.resource_group = None
 
     def run(self):
         print_colored(HOPSWORKS_LOGO, "white")
         self.parse_arguments()
-        self.get_deployment_environment()
         self.check_required_tools()
+        self.get_deployment_environment()
 
         if not self.args.loadbalancer_only:
-            # This is where we branch based on cloud provider
             if self.environment == "GCP":
                 self.setup_gke_prerequisites()
             elif self.environment == "AWS":
-                self.setup_aws_prerequisites()  # Our new method
+                self.setup_aws_prerequisites()      
             else:
                 self.setup_and_verify_kubeconfig()
-
             self.handle_managed_registry()
             self.handle_license_and_user_data()
             if self.install_hopsworks():
@@ -240,55 +131,305 @@ class HopsworksInstaller:
                 self.finalize_installation()
             else:
                 print_colored("Hopsworks installation failed. Please check the logs and try again.", "red")
-                self.clean_up_resources()
                 sys.exit(1)
         else:
+            # For loadbalancer-only, we need to set up the necessary variables
             self.namespace = self.args.namespace
             self.setup_and_verify_kubeconfig()
             self.finalize_installation()
+            
+    def setup_aws_prerequisites(self):
+        """Setup everything needed before cluster creation for AWS"""
+        print_colored("\nSetting up AWS prerequisites...", "blue")
+        
+        # Get AWS profile first
+        self.aws_profile = input("Enter your AWS profile name (default: default): ").strip() or "default"
+        os.environ['AWS_PROFILE'] = self.aws_profile
+        
+        # Get region if not already set
+        self.region = self.get_aws_region()
+        
+        # Get or generate cluster name
+        self.cluster_name = input("Enter your EKS cluster name: ").strip() or f"hopsworks-{int(time.time())}"
+        
+        # Get AWS account ID
+        cmd = f"aws sts get-caller-identity --query Account --output text --profile {self.aws_profile}"
+        success, account_id, _ = run_command(cmd)
+        if not success:
+            print_colored("Failed to get AWS account ID. Please check your AWS credentials.", "red")
+            sys.exit(1)
+        self.aws_account_id = account_id.strip()
 
-    def check_required_tools(self):
-        """Update the required tools check"""
-        if self.environment == "AWS":
-            tools = ["kubectl", "helm", "aws", "eksctl"]  # Added eksctl
-        elif self.environment == "GCP":
-            tools = ["kubectl", "helm", "gcloud"]
-        else:
-            tools = ["kubectl", "helm"]
-
-        for tool in tools:
-            if not shutil.which(tool):
-                print_colored(f"{tool} not found. Please install it and try again.", "red")
+        # Download config files
+        configs = {'eksctl.yaml': '/eksctl.yaml', 'policy.json': '/policy.json'}
+        for file, path in configs.items():
+            cmd = f"curl -sL {INSTALL_RAW}{path} -o {file}"
+            if not run_command(cmd)[0]:
+                print_colored(f"Failed to download {file}", "red")
                 sys.exit(1)
-    def parse_arguments(self):
-        """Parse command line arguments"""
-        parser = argparse.ArgumentParser(description="Hopsworks Installation Script")
-        parser.add_argument('--loadbalancer-only', 
-                        action='store_true', 
-                        help='Jump directly to the LoadBalancer setup')
-        parser.add_argument('--no-user-data', 
-                        action='store_true', 
-                        help='Skip sending user data')
-        parser.add_argument('--skip-license', 
-                        action='store_true', 
-                        help='Skip license agreement step')
-        parser.add_argument('--namespace', 
-                        default='hopsworks', 
-                        help='Namespace for Hopsworks installation')
-        self.args = parser.parse_args()
-        self.namespace = self.args.namespace
+
+        # Update policy.json with account specific info
+        with open('policy.json', 'r') as f:
+            policy = json.load(f)
+            
+        # Update ECR repository ARN
+        for statement in policy['Statement']:
+            if statement['Sid'] == "AllowPushandPullImagesToUserRepo":
+                statement['Resource'] = [
+                    f"arn:aws:ecr:{self.region}:{self.aws_account_id}:repository/*/hopsworks-base"
+                ]
         
-    def get_deployment_environment(self):
-        environments = ["AWS", "Azure", "GCP", "OVH"]
-        print_colored("Select your deployment environment:", "blue")
-        for i, env in enumerate(environments, 1):
-            print(f"{i}. {env}")
-        choice = get_user_input(
-            "Enter the number of your environment:",
-            [str(i) for i in range(1, len(environments) + 1)]
+        with open('policy.json', 'w') as f:
+            json.dump(policy, f, indent=2)
+
+        # Create policy with timestamp
+        timestamp = int(time.time())
+        self.policy_name = f"hopsworks-policy-{timestamp}"
+        cmd = f"aws iam create-policy --policy-name {self.policy_name} --policy-document file://policy.json --profile {self.aws_profile}"
+        if not run_command(cmd)[0]:
+            print_colored("Failed to create IAM policy", "red")
+            sys.exit(1)
+
+        # Get instance type and node count
+        instance_type = input("Enter instance type (default: m6i.2xlarge): ").strip() or "m6i.2xlarge"
+        node_count = input("Enter number of nodes (default: 4): ").strip() or "4"
+
+        # Update eksctl.yaml
+        with open('eksctl.yaml', 'r') as f:
+            config = yaml.safe_load(f)
+        
+        config['metadata']['name'] = self.cluster_name
+        config['metadata']['region'] = self.region
+        
+        # Update node group config
+        config['managedNodeGroups'][0].update({
+            'instanceType': instance_type,
+            'minSize': int(node_count),
+            'maxSize': int(node_count),
+            'desiredCapacity': int(node_count)
+        })
+        
+        # Update policy ARN
+        policy_arn = f"arn:aws:iam::{self.aws_account_id}:policy/{self.policy_name}"
+        config['managedNodeGroups'][0]['iam']['attachPolicyARNs'].append(policy_arn)
+
+        with open('eksctl.yaml', 'w') as f:
+            yaml.dump(config, f)
+
+        # Create ECR repository
+        print_colored("\nCreating ECR repository...", "cyan")
+        repo_name = f"{self.cluster_name}/hopsworks-base"
+        cmd = f"aws ecr create-repository --repository-name {repo_name} --profile {self.aws_profile} --region {self.region}"
+        if not run_command(cmd)[0]:
+            print_colored("Failed to create ECR repository", "red")
+            sys.exit(1)
+
+        # Create EKS cluster
+        print_colored("\nCreating EKS cluster (this might take a while)...", "cyan")
+        cmd = f"eksctl create cluster -f eksctl.yaml --profile {self.aws_profile}"
+        if not run_command(cmd)[0]:
+            print_colored("Failed to create EKS cluster", "red")
+            sys.exit(1)
+
+        # Setup AWS Load Balancer Controller
+        print_colored("\nSetting up AWS Load Balancer Controller...", "cyan")
+        cmd = "helm repo add eks https://aws.github.io/eks-charts && helm repo update"
+        if not run_command(cmd)[0]:
+            print_colored("Failed to add EKS Helm repo", "red")
+            sys.exit(1)
+
+        cmd = (f"helm install aws-load-balancer-controller eks/aws-load-balancer-controller "
+            f"-n kube-system --set clusterName={self.cluster_name}")
+        if not run_command(cmd)[0]:
+            print_colored("Failed to install AWS Load Balancer Controller", "red")
+            sys.exit(1)
+
+        print_colored("\nAWS prerequisites setup completed successfully!", "green")
+        return True
+
+    def setup_gke_prerequisites(self):
+        """Setup everything needed before cluster creation"""
+        print_colored("\nSetting up GKE prerequisites...", "blue")
+
+        # 1. Get essential info first
+        self.project_id = input("Enter your GCP project ID: ").strip()
+        zone_input = input("Enter your GCP zone (e.g. europe-west1-b): ").strip()
+        self.zone = zone_input
+        self.region = '-'.join(zone_input.split('-')[:-1])  # extract region from zone
+
+        # 2. Create role with timestamp to avoid collision
+        timestamp = int(time.time())
+        self.role_name = f"hopsworksai.instances.{timestamp}"  # Unique role name
+        print_colored(f"Creating role '{self.role_name}'...", "cyan")
+
+        role_file = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False)
+        try:
+            role_def = {
+                "title": "Hopsworks AI Instances",
+                "description": "Role for Hopsworks instances",
+                "stage": "GA",
+                "includedPermissions": [
+                    # Artifact Registry permissions
+                    "artifactregistry.repositories.create",
+                    "artifactregistry.repositories.get",
+                    "artifactregistry.repositories.uploadArtifacts",
+                    "artifactregistry.repositories.downloadArtifacts",
+                    "artifactregistry.tags.list",
+                    "artifactregistry.repositories.list"
+                ]
+            }
+            yaml.dump(role_def, role_file)
+            role_file.close()
+
+            success, _, error = run_command(
+                f"gcloud iam roles create {self.role_name} --project={self.project_id} --file={role_file.name}"
+            )
+            if not success:
+                print_colored(f"Failed to create role: {error}", "red")
+                sys.exit(1)
+            else:
+                print_colored(f"Role '{self.role_name}' created successfully.", "green")
+        finally:
+            os.unlink(role_file.name)
+
+        # 3. Create/update service account
+        sa_name = "hopsworksai-instances"
+        self.sa_email = f"{sa_name}@{self.project_id}.iam.gserviceaccount.com"
+
+        # Check if SA exists first
+        success, _, _ = run_command(
+            f"gcloud iam service-accounts describe {self.sa_email} --project={self.project_id}",
+            verbose=False
         )
-        self.environment = environments[int(choice) - 1]
+
+        if not success:
+            success, _, error = run_command(
+                f"gcloud iam service-accounts create {sa_name} "
+                f"--project={self.project_id} "
+                f"--description='Service account for Hopsworks' "
+                f"--display-name='Hopsworks Service Account'"
+            )
+            if not success and "already exists" not in error:
+                print_colored(f"Failed to create service account: {error}", "red")
+                sys.exit(1)
+            else:
+                print_colored(f"Service account '{self.sa_email}' created.", "green")
+        else:
+            print_colored(f"Service account '{self.sa_email}' already exists.", "green")
+
+        # 4. Update role binding
+        print_colored("Updating role binding...", "cyan")
+        # Remove existing binding if it exists
+        run_command(
+            f"gcloud projects remove-iam-policy-binding {self.project_id} "
+            f"--member=serviceAccount:{self.sa_email} "
+            f"--role=projects/{self.project_id}/roles/{self.role_name}",
+            verbose=False
+        )
+
+        success, _, error = run_command(
+            f"gcloud projects add-iam-policy-binding {self.project_id} "
+            f"--member=serviceAccount:{self.sa_email} "
+            f"--role=projects/{self.project_id}/roles/{self.role_name}"
+        )
+        if not success:
+            print_colored(f"Failed to bind role: {error}", "red")
+            sys.exit(1)
+        else:
+            print_colored(f"Role '{self.role_name}' bound to service account '{self.sa_email}'.", "green")
+
+        # 5. NOW we can create the cluster with the service account
+        self.cluster_name = input("Enter your GKE cluster name: ").strip() or "hopsworks-cluster"
+        node_count = input("Enter number of nodes (default: 6): ").strip() or "6"
+        machine_type = input("Enter machine type (default: n2-standard-8): ").strip() or "n2-standard-8"
+
+        cluster_cmd = (f"gcloud container clusters create {self.cluster_name} "
+                       f"--zone={self.zone} "
+                       f"--machine-type={machine_type} "
+                       f"--num-nodes={node_count} "
+                       f"--enable-ip-alias "
+                       f"--service-account={self.sa_email}")
         
+        print_colored("Creating GKE cluster...", "cyan")
+        if not run_command(cluster_cmd)[0]:
+            print_colored("Failed to create GKE cluster.", "red")
+            sys.exit(1)
+        else:
+            print_colored(f"GKE cluster '{self.cluster_name}' created.", "green")
+
+        # 6. Configure kubectl
+        print_colored("Configuring kubectl...", "cyan")
+        run_command(f"gcloud container clusters get-credentials {self.cluster_name} "
+                    f"--zone={self.zone} "
+                    f"--project={self.project_id}")
+
+        # 7. Setup Artifact Registry
+        registry_name = f"hopsworks-{self.cluster_name}"
+        print_colored("Creating Artifact Registry repository...", "cyan")
+        success, _, error = run_command(f"gcloud artifacts repositories create {registry_name} "
+                    f"--repository-format=docker "
+                    f"--location={self.region} "
+                    f"--project={self.project_id}")
+        if not success and "already exists" not in error:
+            print_colored(f"Failed to create Artifact Registry: {error}", "red")
+            sys.exit(1)
+        else:
+            print_colored(f"Artifact Registry repository '{registry_name}' created or already exists.", "green")
+
+        # Now, set up GKE authentication
+        self.setup_gke_authentication()
+
+    def setup_gke_authentication(self):
+        """Setup GKE auth with proper Workload Identity"""
+        # 1. Create and bind Kubernetes service account
+        print_colored("Setting up Kubernetes service account...", "cyan")
+        run_command(f"kubectl create namespace {self.namespace} --dry-run=client -o yaml | kubectl apply -f -")
+        run_command(f"kubectl create serviceaccount -n {self.namespace} hopsworks-sa")
+        
+        # Bind the GCP SA to K8s SA
+        workload_binding = (
+            f"gcloud iam service-accounts add-iam-policy-binding {self.sa_email} "
+            f"--role roles/iam.workloadIdentityUser "
+            f"--member \"serviceAccount:{self.project_id}.svc.id.goog[{self.namespace}/hopsworks-sa]\""
+        )
+        run_command(workload_binding)
+
+        # Annotate the K8s SA
+        run_command(
+            f"kubectl annotate serviceaccount -n {self.namespace} hopsworks-sa "
+            f"iam.gke.io/gcp-service-account={self.sa_email}"
+        )
+
+        # 2. Setup Docker config for both GCP and hops.works registries
+        docker_config = {
+            "credHelpers": {
+                f"{self.region}-docker.pkg.dev": "gcloud",
+                "docker.hops.works": "gcloud"
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(docker_config, f)
+            config_file = f.name
+
+        run_command(f"kubectl create configmap docker-config -n {self.namespace} "
+                   f"--from-file=config.json={config_file} "
+                   f"--dry-run=client -o yaml | kubectl apply -f -")
+        
+        os.unlink(config_file)
+        return True
+
+    def setup_and_verify_kubeconfig(self):
+        while True:
+            self.kubeconfig_path, self.cluster_name, self.region = self.setup_kubeconfig()
+            if self.kubeconfig_path:
+                if self.verify_kubeconfig():
+                    break
+            else:
+                print_colored("Failed to set up a valid kubeconfig.", "red")
+                if not get_user_input("Do you want to try again? (yes/no):", ["yes", "no"]).lower() == "yes":
+                    sys.exit(1)
+
     def setup_kubeconfig(self):
         print_colored(f"\nSetting up kubeconfig for {self.environment}...", "blue")
 
@@ -297,6 +438,7 @@ class HopsworksInstaller:
         region = None
 
         if self.environment == "AWS":
+            # Existing AWS logic
             cluster_name = input("Enter your EKS cluster name: ").strip()
             region = self.get_aws_region()
             cmd = f"aws eks get-token --cluster-name {cluster_name} --region {region}"
@@ -307,7 +449,37 @@ class HopsworksInstaller:
                     print_colored("Failed to update kubeconfig.", "red")
                     return None, None, None
             kubeconfig_path = os.path.expanduser("~/.kube/config")
+
+        elif self.environment == "GCP":
+            if self.args.loadbalancer_only:
+                cluster_name = input("Enter your GKE cluster name: ").strip()
+                self.project_id = input("Enter your GCP project ID: ").strip()
+                zone_input = input("Enter your GCP zone (e.g. europe-west1-b): ").strip()
+                self.zone = zone_input
+                self.region = '-'.join(zone_input.split('-')[:-1])  # extract region from zone
+            else:
+                # Since we handle GCP kubeconfig in setup_gke_prerequisites, skip here
+                cluster_name = self.cluster_name
+
+            cmd = f"gcloud container clusters get-credentials {cluster_name} --project {self.project_id} --zone {self.zone}"
+            if not run_command(cmd)[0]:
+                print_colored("Failed to get GKE credentials. Check your gcloud setup.", "red")
+                return None, None, None
+
+            run_command("gcloud auth configure-docker", verbose=False)
+            kubeconfig_path = os.path.expanduser("~/.kube/config")
+
+        elif self.environment == "Azure":
+            self.resource_group = input("Enter your Azure resource group name: ").strip()
+            cluster_name = input("Enter your AKS cluster name: ").strip()
+            cmd = f"az aks get-credentials --resource-group {self.resource_group} --name {cluster_name} --overwrite-existing"
+            if not run_command(cmd)[0]:
+                print_colored("Failed to get AKS credentials. Check your Azure CLI configuration and permissions.", "red")
+                return None, None, None
+            kubeconfig_path = os.path.expanduser("~/.kube/config")
+
         else:
+            # Other environments
             kubeconfig_path = input("Enter the path to your kubeconfig file: ").strip()
             kubeconfig_path = os.path.expanduser(kubeconfig_path)
             if not os.path.exists(kubeconfig_path):
@@ -325,55 +497,107 @@ class HopsworksInstaller:
 
     def verify_kubeconfig(self):
         print_colored("\nVerifying kubeconfig...", "cyan")
-        
+
         # Check current context
         cmd = "kubectl config current-context"
         success, output, error = run_command(cmd, verbose=True)
         if not success:
             print_colored(f"Failed to get current context. Error: {error}", "red")
             return False
-        
+
         # Try to list namespaces
         cmd = "kubectl get namespaces"
         success, output, error = run_command(cmd, verbose=True)
         if not success:
             print_colored(f"Failed to list namespaces. Error: {error}", "red")
             return False
-        
+
         print_colored("Kubeconfig verified successfully.", "green")
         return True
 
+    def check_required_tools(self):
+        tools = ["kubectl", "helm"]
+        if self.environment == "GCP":
+            tools.append("gcloud")
+        elif self.environment == "AWS":
+            tools.append("aws")
+        elif self.environment == "Azure":
+            tools.append("az")
+        for tool in tools:
+            if not shutil.which(tool):
+                print_colored(f"{tool} not found. Please install it and try again.", "red")
+                sys.exit(1)
+
+    def parse_arguments(self):
+        parser = argparse.ArgumentParser(description="Hopsworks Installation Script")
+        parser.add_argument('--loadbalancer-only', action='store_true', help='Jump directly to the LoadBalancer setup')
+        parser.add_argument('--no-user-data', action='store_true', help='Skip sending user data')
+        parser.add_argument('--skip-license', action='store_true', help='Skip license agreement step')
+        parser.add_argument('--namespace', default='hopsworks', help='Namespace for Hopsworks installation')
+        self.args = parser.parse_args()
+        self.namespace = self.args.namespace
+
+    def get_deployment_environment(self):
+        environments = ["AWS", "Azure", "GCP", "OVH"]
+        print_colored("Select your deployment environment:", "blue")
+        for i, env in enumerate(environments, 1):
+            print(f"{i}. {env}")
+        choice = get_user_input(
+            "Enter the number of your environment:",
+            [str(i) for i in range(1, len(environments) + 1)]
+        )
+        self.environment = environments[int(choice) - 1]
+
+    def get_aws_region(self):
+        region = os.environ.get('AWS_REGION')
+        if not region:
+            region = input("Enter your AWS region (e.g., us-east-2): ").strip()
+            os.environ['AWS_REGION'] = region
+        return region
+
     def handle_managed_registry(self):
-        """Update registry handling for AWS"""
         if self.environment == "AWS":
-            if not self.args.loadbalancer_only:
-                # Registry is already set up in prerequisites
-                print_colored("Using AWS ECR registry configured during prerequisites...", "blue")
-                account_id = boto3.client('sts').get_caller_identity()['Account']
-                repo_uri = f"{account_id}.dkr.ecr.{self.region}.amazonaws.com"
-                self.managed_registry_info = {
-                    "domain": repo_uri,
-                    "namespace": f"{self.cluster_name}"
-                }
-            else:
-                print_colored("Setting up AWS ECR...", "blue")
-                self.setup_aws_ecr()
+            print_colored("Setting up AWS ECR (required for AWS installations)...", "blue")
+            self.setup_aws_ecr()
         elif self.environment == "GCP":
-            print_colored("Setting up GCP Artifact Registry...", "blue")
+            print_colored("Setting up GCP Artifact Registry (required for GKE installations)...", "blue")
+            # Namespace is already created in setup_gke_authentication
             if not self.setup_gke_registry():
                 print_colored("GCP Artifact Registry setup failed. Cannot proceed with installation.", "red")
                 sys.exit(1)
 
-    def clean_up_resources(self):
-        """Add cleanup method for when things go wrong"""
-        if self.environment == "AWS" and hasattr(self, 'policy_arn'):
-            try:
-                iam_client = boto3.client('iam')
-                iam_client.delete_policy(PolicyArn=self.policy_arn)
-                print_colored(f"Cleaned up IAM policy: {self.policy_arn}", "green")
-            except Exception as e:
-                print_colored(f"Failed to clean up IAM policy: {str(e)}", "yellow")
-        # Add other cleanup tasks as needed
+    def setup_aws_ecr(self):
+        client = boto3.client('ecr', region_name=self.region)
+        base_repo_name = f"hopsworks-{self.cluster_name}/hopsworks-base"
+        try:
+            response = client.create_repository(repositoryName=base_repo_name)
+            repo_uri = response['repository']['repositoryUri']
+        except client.exceptions.RepositoryAlreadyExistsException:
+            repo_uri = client.describe_repositories(repositoryNames=[base_repo_name])['repositories'][0]['repositoryUri']
+
+        self.managed_registry_info = {
+            "domain": repo_uri.split('/')[0],
+            "namespace": f"hopsworks-{self.cluster_name}"
+        }
+        print_colored(f"ECR repository set up: {repo_uri}", "green")
+
+    def setup_gke_registry(self):
+        """Setup Artifact Registry"""
+        try:
+            registry_name = f"hopsworks-{self.cluster_name}"
+            # Just confirm the repo exists
+            run_command(f"gcloud artifacts repositories describe {registry_name} "
+                        f"--location={self.region} "
+                        f"--project={self.project_id}")
+            self.managed_registry_info = {
+                "domain": f"{self.region}-docker.pkg.dev",
+                "namespace": f"{self.project_id}/{registry_name}"
+            }
+            return True
+
+        except Exception as e:
+            print_colored(f"Error during GCP Artifact Registry setup: {str(e)}", "red")
+            return False
 
     def handle_license_and_user_data(self):
         if not self.args.skip_license:
@@ -391,7 +615,7 @@ class HopsworksInstaller:
                 self.installation_id = "unknown"
         else:
             self.installation_id = "debug_mode"
-            
+
     def install_hopsworks(self):
         """Installs Hopsworks with proper registry handling for all cloud providers"""
         print_colored("\nInstalling Hopsworks...", "blue")
@@ -414,8 +638,21 @@ class HopsworksInstaller:
         if not run_command("helm pull hopsworks/hopsworks --untar --devel")[0]:
             print_colored("Failed to pull Hopsworks chart.", "red")
             return False
+        
+        print_colored("Ensuring namespace is ready...", "cyan")
+        max_retries = 30
+        for i in range(max_retries):
+            cmd = f"kubectl get namespace {self.namespace} -o name"
+            success, output, _ = run_command(cmd, verbose=False)
+            if success and output.strip():
+                break
+            print_colored(f"Waiting for namespace to be ready... ({i+1}/{max_retries})", "yellow")
+            time.sleep(2)
+        else:
+            print_colored("Namespace failed to become ready in time", "red")
+            return False
 
-        # Base command with common settings
+        # Default command - OVH uses this base version
         helm_command = (
             f"helm upgrade --install hopsworks-release hopsworks/hopsworks "
             f"--namespace={self.namespace} "
@@ -426,11 +663,11 @@ class HopsworksInstaller:
 
         # Cloud-specific configurations
         if self.environment == "OVH":
-            helm_command = (
+            helm_command =(
                 f"{helm_command}"
                 f" --set global._hopsworks.cloudProvider=OVH"
-            )
-
+            )   
+        
         elif self.environment == "GCP":
             registry_name = f"hopsworks-{self.cluster_name}"
             helm_command = (
@@ -453,49 +690,28 @@ class HopsworksInstaller:
             )
 
         elif self.environment == "AWS":
-            # Create namespace first
-            run_command(f"kubectl create namespace {self.namespace}")
-            
-            # Get account ID for ECR domain
-            account_id = self._get_account_id()
-            ecr_domain = f"{account_id}.dkr.ecr.{self.region}.amazonaws.com"
-            
-            print_colored("Setting up AWS-specific Kubernetes secrets...", "cyan")
-            
-            # Create docker-registry secret for ECR
-            run_command(
-                f"kubectl create secret docker-registry awsregcred "
-                f"--docker-server={ecr_domain} "
-                f"--namespace={self.namespace} "
-                f"--docker-username=AWS "
-                f"--docker-password=$(aws ecr get-login-password --region {self.region})"
-            )
-
             helm_command = (
                 f"{helm_command}"
-                f" --namespace={self.namespace}"
-                f" --create-namespace"
-                f" --set global._hopsworks.storageClassName=ebs-gp3"
                 f" --set global._hopsworks.cloudProvider=AWS"
                 f" --set global._hopsworks.managedDockerRegistery.enabled=true"
                 f" --set global._hopsworks.managedDockerRegistery.credHelper.enabled=true"
                 f" --set global._hopsworks.managedDockerRegistery.credHelper.secretName=awsregcred"
-                f" --set global._hopsworks.managedDockerRegistery.domain={ecr_domain}"
-                f" --set global._hopsworks.managedDockerRegistery.namespace={self.cluster_name}"
+                f" --set global._hopsworks.managedDockerRegistery.domain={self.managed_registry_info['domain']}"
+                f" --set global._hopsworks.managedDockerRegistery.namespace={self.managed_registry_info['namespace']}"
                 f" --set hopsworks.variables.docker_operations_managed_docker_secrets=awsregcred"
                 f" --set hopsworks.variables.docker_operations_image_pull_secrets=awsregcred"
                 f" --set hopsworks.dockerRegistry.preset.secrets[0]=awsregcred"
-                # Standard optimizations
-                f" --set docker-registry.enabled=true"
-                f" --set docker-registry.replicas=1"
                 f" --set global._hopsworks.imagePullPolicy=Always"
                 f" --set hopsworks.replicaCount.worker=1"
                 f" --set rondb.clusterSize.activeDataReplicas=1"
-                f" --set hopsfs.datanode.count=1"
-                f" --set rondb.isMultiNodeCluster=true"
-                f" --set hopsworks.service.worker.external.https.type=LoadBalancer"
-                # Update ingress class to use ALB
+                f" --set hopsfs.datanode.count=2"
+                # Add these new settings for AWS ALB
+                f" --set hopsworks.ingress.enabled=true"
                 f" --set hopsworks.ingress.class=alb"
+                f" --set hopsworks.ingress.annotations.\"kubernetes\\.io/ingress\\.class\"=alb"
+                f" --set hopsworks.ingress.annotations.\"alb\\.ingress\\.kubernetes\\.io/scheme\"=internet-facing"
+                f" --set hopsworks.ingress.annotations.\"alb\\.ingress\\.kubernetes\\.io/target-type\"=ip"
+
             )
 
         elif self.environment == "Azure":
@@ -512,10 +728,10 @@ class HopsworksInstaller:
             )
 
         # Add timeout for all installations
-        helm_command += " --timeout 60m --wait --devel"
+        helm_command += " --timeout 60m --devel"
 
         print_colored("Starting Hopsworks installation...", "cyan")
-
+        
         # Start the status update thread
         stop_event = threading.Event()
         status_thread = threading.Thread(target=periodic_status_update, args=(stop_event, self.namespace))
@@ -534,16 +750,16 @@ class HopsworksInstaller:
         return wait_for_pods_ready(self.namespace)
 
     def get_load_balancer_port(self):
-            cmd = f"kubectl get svc -n {self.namespace} hopsworks-release -o jsonpath='{{.spec.ports[?(@.name==\"https\")].port}}'"
+        cmd = f"kubectl get svc -n {self.namespace} hopsworks-release -o jsonpath='{{.spec.ports[?(@.name==\"https\")].port}}'"
+        success, output, _ = run_command(cmd, verbose=False)
+        if success and output.strip():
+            return output.strip()
+        else:
+            # Fallback to checking node port
+            print_colored("Failed to get LoadBalancer port directly, checking node port...", "yellow")
+            cmd = f"kubectl get svc -n {self.namespace} hopsworks-release -o jsonpath='{{.spec.ports[?(@.name==\"https\")].nodePort}}'"
             success, output, _ = run_command(cmd, verbose=False)
-            if success and output.strip():
-                return output.strip()
-            else:
-                # Fallback to checking node port
-                print_colored("Failed to get LoadBalancer port directly, checking node port...", "yellow")
-                cmd = f"kubectl get svc -n {self.namespace} hopsworks-release -o jsonpath='{{.spec.ports[?(@.name==\"https\")].nodePort}}'"
-                success, output, _ = run_command(cmd, verbose=False)
-                return output.strip() if success and output.strip() else "28181"  # Default fallback
+            return output.strip() if success and output.strip() else "28181"  # Default fallback
 
     def finalize_installation(self):
         load_balancer_address = self.get_load_balancer_address()
@@ -609,14 +825,8 @@ class HopsworksInstaller:
             else:
                 print_colored("Failed to retrieve any LoadBalancer addresses. Please check your service configuration.", "yellow")
                 return None
-    
-def get_user_input(prompt, options=None):
-    while True:
-        response = input(prompt + " ").strip()
-        if options is None or response.lower() in [option.lower() for option in options]:
-            return response
-        print_colored(f"Invalid input. Expected one of: {', '.join(options)}", "yellow")
 
+# Installation utillities 
 def periodic_status_update(stop_event, namespace):
     while not stop_event.is_set():
         cmd = f"kubectl get pods -n {namespace} --no-headers"
@@ -688,7 +898,7 @@ def wait_for_pods_ready(namespace, timeout=600, readiness_threshold=0.7):
     print_colored("Checking pod readiness...", "yellow")
     start_time = time.time()
 
-    critical_pods = ['namenode', 'resourcemanager', 'hopsworks', 'mysql']
+    critical_pods = ['namenode', 'hopsworks', 'mysql']
 
     while time.time() - start_time < timeout:
         cmd = f"kubectl get pods -n {namespace} -o json"
@@ -713,8 +923,8 @@ def wait_for_pods_ready(namespace, timeout=600, readiness_threshold=0.7):
                 print_colored(f"\nSufficient pods are ready! ({readiness_ratio:.2%})", "green")
                 return True
                 
-            # Add manual override after 5 minutes if we hit the threshold
-            if time.time() - start_time > 10:  # 5 minutes passed
+            # Add manual override after x minutes if we hit the threshold
+            if time.time() - start_time > 5:  # x minutes passed
                 if readiness_ratio >= readiness_threshold:
                     print()  # New line for cleaner output
                     proceed = get_user_input("\nMost of the pods are ready! Proceed? (yes/no): ", ["yes", "no"])
@@ -743,6 +953,6 @@ def health_check(namespace):
     return True
 
 if __name__ == "__main__":
-    install_certificates()  # Add this line here
+    install_certificates()
     installer = HopsworksInstaller()
     installer.run()

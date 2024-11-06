@@ -3,3 +3,5 @@ set_kubeconfig.sh
 installation_log.txt
 hopsworks
 mini
+eksctl.yaml
+policy.json
