@@ -263,7 +263,7 @@ class HopsworksInstaller:
         """Enhanced AWS prerequisites setup with proper load balancer support"""
         print_colored("\nSetting up AWS prerequisites...", "blue")
         
-        # 1. Basic AWS setup and verification
+        # 1. Basic AWS setup
         self.aws_profile = input("Enter your AWS profile name (default: default): ").strip() or "default"
         os.environ['AWS_PROFILE'] = self.aws_profile
         
@@ -294,9 +294,7 @@ class HopsworksInstaller:
         
         # Enable versioning on the bucket
         cmd = f"aws s3api put-bucket-versioning --bucket {bucket_name} --versioning-configuration Status=Enabled --profile {self.aws_profile}"
-        if not run_command(cmd)[0]:
-            print_colored("Failed to enable bucket versioning", "red")
-            sys.exit(1)
+        run_command(cmd)
 
         # 3. Create ECR repository
         print_colored("\nCreating ECR repository...", "cyan")
@@ -322,7 +320,7 @@ class HopsworksInstaller:
                         "S3:AbortMultipartUpload", 
                         "S3:ListBucketMultipartUploads",
                         "S3:PutLifecycleConfiguration", 
-                        "S3:GetLifecycleConfiguration",
+                        "S3:GetLifecycleConfiguration"
                         "S3:PutBucketVersioning",
                         "S3:GetBucketVersioning",
                         "S3:ListBucketVersions",
@@ -337,6 +335,7 @@ class HopsworksInstaller:
                     "Sid": "HopsworksECRAccess",
                     "Effect": "Allow",
                     "Action": [
+                        # Instead of "ecr:*", being explicit as per doc while keeping broad access
                         "ecr:GetDownloadUrlForLayer",
                         "ecr:BatchGetImage",
                         "ecr:CompleteLayerUpload",
@@ -351,7 +350,7 @@ class HopsworksInstaller:
                         "ecr:TagResource"
                     ],
                     "Resource": [
-                        f"arn:aws:ecr:{self.region}:{self.aws_account_id}:repository/*/hopsworks-base"
+                        f"arn:aws:ecr:{self.region}:{self.aws_account_id}:repository/*"
                     ]
                 },
                 {
@@ -393,20 +392,17 @@ class HopsworksInstaller:
             ]
         }
         
-        timestamp = int(time.time())
-        with open(f'policy-{timestamp}.json', 'w') as f:
+        with open('policy.json', 'w') as f:
             json.dump(policy, f, indent=2)
 
+        timestamp = int(time.time())
         self.policy_name = f"hopsworks-policy-{timestamp}"
-        cmd = f"aws iam create-policy --policy-name {self.policy_name} --policy-document file://policy-{timestamp}.json --profile {self.aws_profile}"
+        cmd = f"aws iam create-policy --policy-name {self.policy_name} --policy-document file://policy.json --profile {self.aws_profile}"
         if not run_command(cmd)[0]:
             print_colored("Failed to create IAM policy", "red")
             sys.exit(1)
 
-        print_colored("Waiting for policy to propagate...", "yellow")
-        time.sleep(10)  # Give AWS time to propagate the policy
-
-        # 5. Create EKS cluster configuration
+        # 5. Create EKS cluster with enhanced configuration
         print_colored("\nCreating EKS cluster configuration...", "cyan")
         instance_type = input("Enter instance type (default: m6i.2xlarge): ").strip() or "m6i.2xlarge"
         node_count = input("Enter number of nodes (default: 4): ").strip() or "4"
@@ -420,22 +416,22 @@ class HopsworksInstaller:
                 "version": "1.29"
             },
             "iam": {
-                "withOIDC": True,
+                "withOIDC": True,  
             },
             "addons": [{
                 "name": "aws-ebs-csi-driver",
                 "wellKnownPolicies": {
-                    "ebsCSIController": True
+                    "ebsCSIController": True 
                 }
             }],
             "managedNodeGroups": [{
                 "name": "ng-1",
-                "amiFamily": "AmazonLinux2023",
+                "amiFamily": "AmazonLinux2023", 
                 "instanceType": instance_type,
                 "minSize": int(node_count),
                 "maxSize": int(node_count),
                 "volumeSize": 100,
-                "ssh": {
+                "ssh": { 
                     "allow": True
                 },
                 "iam": {
@@ -443,7 +439,7 @@ class HopsworksInstaller:
                         "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
                         "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
                         "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
-                        f"arn:aws:iam::{self.aws_account_id}:policy/{self.policy_name}"
+                        f"arn:aws:iam::{self.aws_account_id}:policy/{self.policy_name}"  
                     ],
                     "withAddonPolicies": {
                         "awsLoadBalancerController": True
@@ -452,66 +448,17 @@ class HopsworksInstaller:
             }]
         }
 
-        with open(f'eksctl-{timestamp}.yaml', 'w') as f:
+        with open('eksctl.yaml', 'w') as f:
             yaml.dump(cluster_config, f)
 
         # 6. Create EKS cluster
-        print_colored("\nCreating EKS cluster (this will take 15-20 minutes)...", "cyan")
-        cmd = f"eksctl create cluster -f eksctl-{timestamp}.yaml --profile {self.aws_profile}"
+        print_colored("\nCreating EKS cluster (this can take 15-20 minutes)...", "cyan")
+        cmd = f"eksctl create cluster -f eksctl.yaml --profile {self.aws_profile}"
         if not run_command(cmd)[0]:
             print_colored("Failed to create EKS cluster", "red")
             sys.exit(1)
 
-        # 7. Verify cluster is ready
-        print_colored("\nVerifying cluster readiness...", "cyan")
-        max_retries = 10
-        for i in range(max_retries):
-            cmd = "kubectl get nodes --no-headers"
-            success, output, _ = run_command(cmd, verbose=False)
-            if success and output.strip():
-                print_colored("Cluster nodes are ready!", "green")
-                break
-            if i < max_retries - 1:
-                print_colored(f"Waiting for nodes to be ready (attempt {i+1}/{max_retries})...", "yellow")
-                time.sleep(30)
-
-        # 8. Create GP3 storage class
-        print_colored("\nCreating GP3 storage class...", "cyan")
-        storage_class = {
-            "apiVersion": "storage.k8s.io/v1",
-            "kind": "StorageClass",
-            "metadata": {
-                "name": "ebs-gp3"
-            },
-            "provisioner": "ebs.csi.aws.com",
-            "parameters": {
-                "type": "gp3",
-                "csi.storage.k8s.io/fstype": "xfs"
-            },
-            "volumeBindingMode": "WaitForFirstConsumer",
-            "reclaimPolicy": "Delete"
-        }
-        
-        with open(f'storage-class-{timestamp}.yaml', 'w') as f:
-            yaml.dump(storage_class, f)
-        
-        if not run_command(f"kubectl apply -f storage-class-{timestamp}.yaml")[0]:
-            print_colored("Failed to create GP3 storage class", "red")
-            sys.exit(1)
-
-        # 9. Set up Helm and verify
-        print_colored("\nVerifying Helm installation...", "cyan")
-        if not run_command("helm version")[0]:
-            print_colored("Helm is not installed or not properly configured", "red")
-            sys.exit(1)
-
-        # Add and update EKS Helm repo
-        if not run_command("helm repo add eks https://aws.github.io/eks-charts")[0]:
-            print_colored("Failed to add EKS Helm repo", "red")
-            sys.exit(1)
-        run_command("helm repo update eks")
-
-        # 10. Set up AWS Load Balancer Controller
+        # 7. Set up AWS Load Balancer Controller
         print_colored("\nSetting up AWS Load Balancer Controller...", "cyan")
         
         # Download and create ALB policy
@@ -520,7 +467,7 @@ class HopsworksInstaller:
             print_colored("Failed to download ALB policy", "red")
             sys.exit(1)
 
-        alb_policy_name = f"AWSLoadBalancerControllerIAMPolicy-{self.cluster_name}-{timestamp}"
+        alb_policy_name = f"AWSLoadBalancerControllerIAMPolicy-{self.cluster_name}"
         cmd = f"aws iam create-policy --policy-name {alb_policy_name} --policy-document file://iam_policy_alb.json --profile {self.aws_profile}"
         run_command(cmd)  # Ignore if policy exists
 
@@ -540,7 +487,7 @@ class HopsworksInstaller:
             print_colored("Failed to create service account for ALB controller", "red")
             sys.exit(1)
 
-        # Install AWS Load Balancer Controller
+        # Install AWS Load Balancer Controller with enhanced configuration
         print_colored("\nInstalling AWS Load Balancer Controller...", "cyan")
         cmd = (f"helm install aws-load-balancer-controller eks/aws-load-balancer-controller "
             f"-n kube-system "
@@ -556,8 +503,10 @@ class HopsworksInstaller:
             print_colored("Failed to install AWS Load Balancer Controller", "red")
             sys.exit(1)
 
-        # 11. Verify final deployment
+        # 8. Verify deployment
         print_colored("\nVerifying AWS Load Balancer Controller deployment...", "cyan")
+        time.sleep(45)  # Give it some time to initialize
+        
         max_retries = 12
         for i in range(max_retries):
             cmd = "kubectl get deployment -n kube-system aws-load-balancer-controller"
@@ -568,11 +517,30 @@ class HopsworksInstaller:
             if i < max_retries - 1:
                 print_colored(f"Waiting for controller to be ready (attempt {i+1}/{max_retries})...", "yellow")
                 time.sleep(10)
-
-        # 12. Cleanup temporary files
-        for file in [f'policy-{timestamp}.json', f'eksctl-{timestamp}.yaml', f'storage-class-{timestamp}.yaml', 'iam_policy_alb.json']:
-            if os.path.exists(file):
-                os.remove(file)
+        
+        # 9. Create GP3 storage class
+        print_colored("\nCreating GP3 storage class...", "cyan")
+        storage_class = {
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": {
+                "name": "ebs-gp3"
+            },
+            "provisioner": "ebs.csi.aws.com",
+            "parameters": {
+                "type": "gp3",
+                "csi.storage.k8s.io/fstype": "xfs"
+            },
+            "volumeBindingMode": "WaitForFirstConsumer",
+            "reclaimPolicy": "Delete"
+        }
+        
+        with open('storage-class.yaml', 'w') as f:
+            yaml.dump(storage_class, f)
+        
+        if not run_command("kubectl apply -f storage-class.yaml")[0]:
+            print_colored("Failed to create GP3 storage class", "red")
+            sys.exit(1)
 
         print_colored("\nAWS prerequisites setup completed successfully!", "green")
         return True
