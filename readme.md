@@ -11,7 +11,7 @@ For your cloud provider, you will need to install their dedicated CLI;
 For **OVHCloud**; you can download the kubeconfig.yml file locally and use it during the installation. Regardless of the cloud provider, be sure to to have the approriate permissions to access ressources and create new ones. 
 
 ## Requirements
-Hopsworks requires a minimum of 6 nodes and Kubernetes >= 1.27.0.
+Hopsworks requires a minimum of 5 nodes and Kubernetes >= 1.27.0.
 Be sure to have a stable connection, you might need to use some of the command line options to continue the installation if you lose connection during the installation. 
 
 # gcloud additional components
