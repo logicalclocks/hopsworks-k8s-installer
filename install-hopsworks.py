@@ -11,7 +11,6 @@ import urllib.error
 import ssl
 import threading
 import boto3
-import base64
 import json
 import tempfile
 import yaml
@@ -587,7 +586,7 @@ class HopsworksInstaller:
 
         # 1. Get essential info first
         self.project_id = input("Enter your GCP project ID: ").strip()
-        zone_input = input("Enter your GCP zone (e.g. europe-west1-b): ").strip()
+        zone_input = input("Enter your GCP zone (e.g., europe-west1-b). Note: If you select a region like europe-west1, deployments will include all sub-zones (a, b, c), potentially multiplying node counts. Proceed with caution: ").strip()
         self.zone = zone_input
         self.region = '-'.join(zone_input.split('-')[:-1])  # extract region from zone
 
@@ -1309,123 +1308,48 @@ def send_user_data(name, email, company, license_type, agreed_to_license):
         print_colored(f"Failed to send user data: {str(e)}", "red")
         return False, installation_id
     
-def wait_for_deployment(namespace, timeout=2800):
+def wait_for_deployment(namespace, timeout=1200):
     """
-    Enhanced deployment monitoring with proper status checks and progress tracking.
-    Returns True if deployment is successful, False otherwise.
+    Simple but effective deployment monitor focusing on core services.
     """
-    stop_event = threading.Event()
-    progress_data = {'last': 0, 'ready_count': 0}
-    
-    def check_critical_components():
-        """Check if critical Hopsworks components are ready"""
-        critical_deployments = [
-            'hopsworks-instance',
-            'rondb-mgmd',
-            'rondb-mysqld',
-            'rondb-ndbd'
-        ]
-        
-        for deployment in critical_deployments:
-            cmd = f"kubectl get pods -l app={deployment} -n {namespace} -o jsonpath='{{.items[*].status.phase}}'"
-            success, output, _ = run_command(cmd, verbose=False)
-            if not success or 'Running' not in output:
-                return False
-        return True
-
-    def check_service_health():
-        """Check if essential services are responding"""
-        cmd = f"kubectl get pods -n {namespace} -o jsonpath='{{.items[*].status.containerStatuses[*].ready}}'"
-        success, output, _ = run_command(cmd, verbose=False)
-        if not success:
-            return False
-        
-        ready_states = [state == "true" for state in output.split()]
-        return len(ready_states) > 0 and all(ready_states)
-
-    def monitor_progress():
-        start_time = time.time()
-        last_status_time = start_time
-        status_interval = 30  # Status update every 30 seconds
-        
-        while not stop_event.is_set():
-            current_time = time.time()
-            
-            # Get jobs status
-            cmd = f"kubectl get jobs -n {namespace} --no-headers"
-            success, output, _ = run_command(cmd, verbose=False)
-            
-            if success and output.strip():
-                total_jobs = len(output.strip().split('\n'))
-                completed = len([l for l in output.strip().split('\n') if l.split()[1].startswith('1')])
-                progress = (completed / total_jobs * 100) if total_jobs > 0 else 0
-                
-                # Regular progress update
-                if progress != progress_data['last']:
-                    elapsed = int(current_time - start_time)
-                    print_colored(f"\rProgress: {progress:.1f}% ({elapsed}s elapsed)", "cyan", end='')
-                    progress_data['last'] = progress
-                
-                # Detailed status update
-                if current_time - last_status_time >= status_interval:
-                    print("\n")  # New line for status
-                    
-                    # Check critical components
-                    if check_critical_components():
-                        progress_data['ready_count'] += 1
-                        print_colored("✓ Critical components are running", "green")
-                        
-                        # Only check service health if critical components are ready
-                        if check_service_health():
-                            print_colored("✓ Essential services are healthy", "green")
-                            
-                            if progress >= 85:  # Lower threshold for user choice
-                                print("\nSystem appears to be operational!")
-                                print_colored("Options:", "cyan")
-                                print_colored("1. Wait for full completion (recommended for first install)", "cyan")
-                                print_colored("2. Proceed now (safe for upgrades/reinstalls)", "cyan")
-                                return True
-                    else:
-                        print_colored("⋯ Waiting for critical components...", "yellow")
-                    
-                    last_status_time = current_time
-            
-            time.sleep(5)
-        return False
-
-    print_colored("\nMonitoring deployment progress...", "blue")
-    print_colored("This will take 15-20 minutes for a fresh installation.", "yellow")
-    
-    monitor_thread = threading.Thread(target=monitor_progress)
-    monitor_thread.daemon = True
-    monitor_thread.start()
-    
+    print_colored("\nMonitoring core services...", "blue")
     start_time = time.time()
-    while time.time() - start_time < timeout:
-        if progress_data['ready_count'] >= 3:  # Multiple successful health checks
-            choice = input("\nEnter 2 to proceed now, or press Enter to continue waiting: ").strip()
-            if choice == "2":
-                stop_event.set()
+    
+    core_services = ["hopsworks-instance"]
+    
+    while (time.time() - start_time) < timeout:
+        # Check our core pods
+        ready = True
+        for svc in core_services:
+            cmd = f"kubectl get pods -n {namespace} -l app={svc} -o jsonpath='{{.items[0].status.phase}}'"
+            success, status, _ = run_command(cmd, verbose=False)
+            if not success or status.strip() != "Running":
+                ready = False
+                break
+        
+        # Check jobs completion
+        cmd = f"kubectl get jobs -n {namespace} --no-headers"
+        success, output, _ = run_command(cmd, verbose=False)
+        jobs_done = 0
+        if success and output.strip():
+            total_jobs = len(output.strip().split('\n'))
+            jobs_done = len([l for l in output.strip().split('\n') if l.split()[1].startswith('1')])
+            progress = (jobs_done / total_jobs * 100)
+            
+            elapsed = int(time.time() - start_time)
+            print_colored(f"\rProgress: {progress:.1f}% ({jobs_done}/{total_jobs} jobs) | {elapsed}s elapsed", "cyan", end='')
+            
+            if ready and progress > 85:
+                print("\n")
+                print_colored("Core services are ready!", "green")
+                print_colored("You can proceed (background tasks will continue)", "cyan")
                 return True
+        
         time.sleep(5)
     
-    stop_event.set()
     print_colored(f"\nTimeout after {timeout/60:.1f} minutes.", "red")
-    print_colored("The installation might still complete in background.", "yellow")
-    print_colored("Use --loadbalancer-only to check status later.", "yellow")
     return False
 
-def health_check(namespace):
-    print_colored("\nPerforming basic health check...", "blue")
-
-    cmd = f"kubectl get pods -n {namespace} -o jsonpath='{{.items[*].status.phase}}'"
-    success, output, _ = run_command(cmd, verbose=False)
-    if not success or 'Running' not in output:
-        print_colored("Not all pods are in Running state. Health check failed.", "red")
-        return False
-
-    print_colored("Basic health check passed.", "green")
-    return True
 
 if __name__ == "__main__":
     install_certificates()
