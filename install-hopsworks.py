@@ -67,6 +67,7 @@ CLOUD_SPECIFIC_VALUES = {
             "global._hopsworks.cloudProvider": "GCP",
             "global._hopsworks.managedDockerRegistery.enabled": "true",
             "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
+            "global._hopsworks.managedDockerRegistery.credHelper.configMap": "docker-config",
             "global._hopsworks.managedDockerRegistery.credHelper.secretName": "gcrregcred",
             "hopsworks.variables.docker_operations_managed_docker_secrets": "gcrregcred",
             "hopsworks.variables.docker_operations_image_pull_secrets": "gcrregcred",
