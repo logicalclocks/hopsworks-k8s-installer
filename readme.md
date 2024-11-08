@@ -36,12 +36,12 @@ Hopsworks UI URL
 Default login credentials
 
 ## Cleaning Up ressources
-We provide _cleanup-aks.sh_, _cleanup-eks.sh_ and _cleanup-gke.sh_ to help cleanup ressources, roles and registry in case you need to re-install or are attempting to reinstall. **Be careful using those script** as they might remove additional roles and permissions.
+We provide _cleanup-aks.sh_, _cleanup-eks.py_ and _cleanup-gke.sh_ to help cleanup ressources, roles and registry in case you need to re-install or are attempting to reinstall. **Be careful using those script** as they might remove additional roles and permissions.
 
 ### Example Usage:
 ```bash
 chmod +x cleanup-gke.sh
-./cleanup-gke.sh "your project id" " your project zone (eg:us-central1-a)" "your project region (eg:us-central1)" "your cluster name"
+./cleanup-gke.sh "your project id"
 ```
 
 
