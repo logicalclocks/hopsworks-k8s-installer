@@ -847,37 +847,91 @@ subjects:
         return True
     
     def handle_azure_registry(self):
-        """Setup minimal Docker registry auth for Azure"""
+        """Setup Docker registry auth for Azure with proper error handling and verification"""
         print_colored("\nSetting up Docker registry credentials...", "blue")
         
-        # Get Docker registry credentials
-        docker_user = input("Enter your Hopsworks Docker registry username: ").strip()
-        docker_pass = input("Enter your Hopsworks Docker registry password: ").strip()
+        # Get Docker registry credentials with basic validation
+        while True:
+            docker_user = input("Enter your Hopsworks Docker registry username: ").strip()
+            if docker_user:
+                break
+            print_colored("Username cannot be empty.", "yellow")
         
-        # Create Docker registry secret
-        cmd = (f"kubectl create secret docker-registry regcred "
-            f"--namespace={self.namespace} "
-            f"--docker-server=docker.hops.works "
-            f"--docker-username={docker_user} "
-            f"--docker-password={docker_pass} "
-            "--docker-email=noreply@hopsworks.ai")
-        
-        if not run_command(cmd)[0]:
-            print_colored("Failed to create Docker registry secret.", "red")
-            sys.exit(1)
-        
-        print_colored("Docker registry setup completed.", "green")
+        while True:
+            docker_pass = input("Enter your Hopsworks Docker registry password: ").strip()
+            if docker_pass:
+                break
+            print_colored("Password cannot be empty.", "yellow")
 
-        # Create secret for Hopsworks registry too
-        cmd = (f"kubectl create secret docker-registry hopsworks-registry-secret "
-            f"--namespace={self.namespace} "
-            f"--docker-server=docker.hops.works "
-            f"--docker-username={docker_user} "
-            f"--docker-password={docker_pass} "
-            "--docker-email=noreply@hopsworks.ai")
+        # Define our secrets configuration
+        registry_secrets = [
+            {
+                "name": "regcred",  # Primary secret referenced in Helm values
+                "server": "docker.hops.works",
+                "required": True  # This one must succeed
+            },
+            {
+                "name": "hopsworks-registry-secret",  # Backup secret for additional components
+                "server": "docker.hops.works",
+                "required": False  # This one can fail if it exists
+            }
+        ]
         
-        run_command(cmd)  # This might fail if exists, that's OK
+        # Track if we've successfully created the required secrets
+        required_secrets_created = False
+        
+        for secret_config in registry_secrets:
+            print_colored(f"\nCreating secret {secret_config['name']}...", "cyan")
+            
+            # First try to delete any existing secret
+            cleanup_cmd = f"kubectl delete secret {secret_config['name']} -n {self.namespace} --ignore-not-found=true"
+            run_command(cleanup_cmd, verbose=False)
+            
+            # Create the new secret
+            create_cmd = (
+                f"kubectl create secret docker-registry {secret_config['name']} "
+                f"--namespace={self.namespace} "
+                f"--docker-server={secret_config['server']} "
+                f"--docker-username={docker_user} "
+                f"--docker-password={docker_pass} "
+                "--docker-email=noreply@hopsworks.ai"
+            )
+            
+            success, output, error = run_command(create_cmd)
+            
+            if success:
+                print_colored(f"Successfully created secret {secret_config['name']}", "green")
+                if secret_config['required']:
+                    required_secrets_created = True
+            else:
+                error_msg = f"Failed to create secret {secret_config['name']}"
+                if "already exists" in error:
+                    print_colored(f"{error_msg} (already exists)", "yellow")
+                    if secret_config['required']:
+                        required_secrets_created = True
+                else:
+                    print_colored(f"{error_msg}: {error}", "red")
+                    if secret_config['required'] and not required_secrets_created:
+                        print_colored("Failed to create required registry secret. Cannot proceed.", "red")
+                        sys.exit(1)
 
+        # Verify the secrets were created
+        print_colored("\nVerifying registry secrets...", "cyan")
+        verify_cmd = f"kubectl get secrets -n {self.namespace} | grep -E 'regcred|hopsworks-registry-secret'"
+        success, output, _ = run_command(verify_cmd, verbose=False)
+        
+        if success and 'regcred' in output:
+            print_colored("\nRegistry secrets setup completed successfully.", "green")
+            # Store this for potential use in other methods
+            self.registry_secrets_created = True
+            return True
+        else:
+            print_colored("Warning: Registry secrets verification failed.", "yellow")
+            print_colored("This might cause issues with pulling images.", "yellow")
+            # Don't exit here - let the installation continue and potentially fail later
+            self.registry_secrets_created = False
+            return False
+        
     def setup_and_verify_kubeconfig(self):
         while True:
             self.kubeconfig_path, self.cluster_name, self.region = self.setup_kubeconfig()
