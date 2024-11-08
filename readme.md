@@ -27,7 +27,6 @@ python3 install-hopsworks.py | tee installation_log.txt
 - `--loadbalancer-only`: Skip installation and jump to LoadBalancer setup
 - `--no-user-data`: Skip sending user data
 - `--skip-license`: Skip license agreement step
-- `--namespace NAMESPACE`: Specify a custom namespace (default: 'hopsworks')
 
 ## Post-Installation
 After successful installation, the script will provide:
@@ -37,7 +36,7 @@ Hopsworks UI URL
 Default login credentials
 
 ## Cleaning Up ressources
-We provide _cleanup-aks.sh_, _cleanup-eks.sh_ and _cleanup-gke.sh_ to help cleanup ressources, roles and registry in case you need to re-install or are attempting to reinstall. Be careful using those script as they might remove additional roles and permissions.
+We provide _cleanup-aks.sh_, _cleanup-eks.sh_ and _cleanup-gke.sh_ to help cleanup ressources, roles and registry in case you need to re-install or are attempting to reinstall. **Be careful using those script** as they might remove additional roles and permissions.
 
 ### Example Usage:
 ```bash
