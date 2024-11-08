@@ -181,9 +181,12 @@ class HopsworksInstaller:
             if self.environment == "GCP":
                 self.setup_gke_prerequisites()
             elif self.environment == "AWS":
-                self.setup_aws_prerequisites()      
+                self.setup_aws_prerequisites()
+            elif self.environment == "Azure":
+                self.setup_aks_prerequisites()  # This will create the cluster
             else:
-                self.setup_and_verify_kubeconfig()
+                self.setup_and_verify_kubeconfig()  # Only for other environments
+                
             self.handle_managed_registry()
             self.handle_license_and_user_data()
             if self.install_hopsworks():
@@ -761,7 +764,7 @@ class HopsworksInstaller:
 
         # Get resource group - create if doesn't exist
         self.resource_group = input("Enter your Azure resource group name: ").strip()
-        location = input("Enter Azure region (e.g., eastus): ").strip() or "eastus"
+        location = input("Enter Azure region (eg. eastus): ").strip() or "eastus"
         
         # Check if resource group exists, create if it doesn't
         if not run_command(f"az group show --name {self.resource_group}", verbose=False)[0]:
@@ -783,13 +786,13 @@ class HopsworksInstaller:
             f"--name {self.cluster_name} "
             f"--node-count {node_count} "
             f"--node-vm-size {machine_type} "
+            f"--location {location} "
             f"--network-plugin azure "
             f"--generate-ssh-keys "
-            f"--load-balancer-sku standard "  # Important for Hopsworks
-            f"--enable-managed-identity "  # Needed for basic Azure integration
-            f"--network-policy azure "  # Better network isolation
-            f"--kubernetes-version 1.27.7 "  # Known good version
-            f"--no-wait"  # Start the creation and proceed with other setup
+            f"--load-balancer-sku standard "  
+            f"--enable-managed-identity " 
+            f"--network-policy azure " 
+            f"--no-wait" 
         )
         
         if not run_command(cluster_cmd)[0]:
