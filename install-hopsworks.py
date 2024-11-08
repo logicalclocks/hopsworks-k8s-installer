@@ -674,7 +674,7 @@ class HopsworksInstaller:
 
         # 5. NOW we can create the cluster with the service account
         self.cluster_name = input("Enter your GKE cluster name: ").strip() or "hopsworks-cluster"
-        node_count = input("Enter number of nodes (default: 6): ").strip() or "6"
+        node_count = input("Enter number of nodes (default: 5): ").strip() or "5"
         machine_type = input("Enter machine type (default: n2-standard-8): ").strip() or "n2-standard-8"
 
         cluster_cmd = (f"gcloud container clusters create {self.cluster_name} "
@@ -775,7 +775,7 @@ class HopsworksInstaller:
 
         # Get cluster details
         self.cluster_name = input("Enter your AKS cluster name: ").strip()
-        node_count = input("Enter number of nodes (default: 3): ").strip() or "3"
+        node_count = input("Enter number of nodes (default: 5): ").strip() or "5"
         machine_type = input("Enter machine type (default: Standard_D8_v4): ").strip() or "Standard_D8_v4"
 
         # Create AKS cluster with minimal config but all we need
