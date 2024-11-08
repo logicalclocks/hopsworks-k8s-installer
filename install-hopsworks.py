@@ -1328,12 +1328,14 @@ def wait_for_deployment(namespace, timeout=1200):
                 break
         
         # Check jobs completion
-        cmd = f"kubectl get jobs -n {namespace} --no-headers"
+        cmd = f"kubectl get jobs -n {namespace} --no-headers | awk '{{print $2}}'"
         success, output, _ = run_command(cmd, verbose=False)
         jobs_done = 0
         if success and output.strip():
-            total_jobs = len(output.strip().split('\n'))
-            jobs_done = len([l for l in output.strip().split('\n') if l.split()[1].startswith('1')])
+            jobs = output.strip().split('\n')
+            total_jobs = len(jobs)
+            # Count jobs that show "1/1" completion
+            jobs_done = len([j for j in jobs if j == "1/1"])
             progress = (jobs_done / total_jobs * 100)
             
             elapsed = int(time.time() - start_time)
@@ -1349,7 +1351,6 @@ def wait_for_deployment(namespace, timeout=1200):
     
     print_colored(f"\nTimeout after {timeout/60:.1f} minutes.", "red")
     return False
-
 
 if __name__ == "__main__":
     install_certificates()
