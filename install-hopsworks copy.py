@@ -28,6 +28,7 @@ HOPSWORKS_LOGO = """
 SERVER_URL = "https://magiclex--hopsworks-installation-hopsworks-installation.modal.run/"
 STARTUP_LICENSE_URL = "https://www.hopsworks.ai/startup-license"
 EVALUATION_LICENSE_URL = "https://www.hopsworks.ai/evaluation-license"
+INSTALL_RAW = "https://raw.githubusercontent.com/MagicLex/hopsworks-k8s-installer/refs/heads/master/assets"
 KNOWN_NONFATAL_ERRORS = [
     "invalid ingress class: IngressClass.networking.k8s.io",
 ]
@@ -313,18 +314,7 @@ class HopsworksInstaller:
                     "Sid": "HopsworksS3Access",
                     "Effect": "Allow",
                     "Action": [
-                        "S3:PutObject", 
-                        "S3:ListBucket", 
-                        "S3:GetObject", 
-                        "S3:DeleteObject",
-                        "S3:AbortMultipartUpload", 
-                        "S3:ListBucketMultipartUploads",
-                        "S3:PutLifecycleConfiguration", 
-                        "S3:GetLifecycleConfiguration"
-                        "S3:PutBucketVersioning",
-                        "S3:GetBucketVersioning",
-                        "S3:ListBucketVersions",
-                        "S3:DeleteObjectVersion"
+                        "s3:*"
                     ],
                     "Resource": [
                         f"arn:aws:s3:::{bucket_name}/*",
@@ -335,19 +325,7 @@ class HopsworksInstaller:
                     "Sid": "HopsworksECRAccess",
                     "Effect": "Allow",
                     "Action": [
-                        # Instead of "ecr:*", being explicit as per doc while keeping broad access
-                        "ecr:GetDownloadUrlForLayer",
-                        "ecr:BatchGetImage",
-                        "ecr:CompleteLayerUpload",
-                        "ecr:UploadLayerPart",
-                        "ecr:InitiateLayerUpload",
-                        "ecr:BatchCheckLayerAvailability",
-                        "ecr:PutImage",
-                        "ecr:ListImages",
-                        "ecr:BatchDeleteImage",
-                        "ecr:GetLifecyclePolicy",
-                        "ecr:PutLifecyclePolicy",
-                        "ecr:TagResource"
+                        "ecr:*"
                     ],
                     "Resource": [
                         f"arn:aws:ecr:{self.region}:{self.aws_account_id}:repository/*"
@@ -418,34 +396,25 @@ class HopsworksInstaller:
             "iam": {
                 "withOIDC": True,  
             },
-            "addons": [{
-                "name": "aws-ebs-csi-driver",
-                "wellKnownPolicies": {
-                    "ebsCSIController": True 
-                }
-            }],
             "managedNodeGroups": [{
                 "name": "ng-1",
                 "amiFamily": "AmazonLinux2023", 
-                "instanceType": instance_type,
+                "instanceType": "m6i.2xlarge",
                 "minSize": int(node_count),
                 "maxSize": int(node_count),
                 "volumeSize": 100,
-                "ssh": { 
-                    "allow": True
-                },
                 "iam": {
                     "attachPolicyARNs": [
                         "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
                         "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
                         "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
-                        f"arn:aws:iam::{self.aws_account_id}:policy/{self.policy_name}"  
                     ],
                     "withAddonPolicies": {
                         "awsLoadBalancerController": True
                     }
                 }
-            }]
+            }],
+
         }
 
         with open('eksctl.yaml', 'w') as f:
