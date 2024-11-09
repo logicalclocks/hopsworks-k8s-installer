@@ -707,7 +707,7 @@ class HopsworksInstaller:
                     f"--project={self.project_id}")
 
         # 7. Setup Artifact Registry
-        registry_name = f"hopsworks-{self.cluster_name}"
+        registry_name = f"hopsworks-{self.cluster_name}-{timestamp}"
         print_colored("Creating Artifact Registry repository...", "cyan")
         success, _, error = run_command(f"gcloud artifacts repositories create {registry_name} "
                     f"--repository-format=docker "
