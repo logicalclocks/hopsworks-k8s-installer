@@ -88,24 +88,7 @@ CLOUD_SPECIFIC_VALUES = {
 }
 
 # Utilities 
-def install_certificates():
-    """Install SSL certificates for Python on macOS"""
-    if sys.platform != "darwin":
-        print_colored("Certificate installation only needed on macOS", "yellow")
-        return
-        
-    try:
-        import ssl
-        import certifi
-        
-        # Set the default SSL context to use certifi's certificates
-        ssl._create_default_https_context = ssl._create_unverified_context
-        print_colored("SSL certificate verification temporarily disabled", "yellow")
-    except ImportError:
-        print_colored("Installing certifi...", "cyan")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "certifi"])
-        print_colored("Certifi installed successfully", "green")
-        
+
 def print_colored(message, color, **kwargs):
     colors = {
         "red": "\033[91m", "green": "\033[92m", "yellow": "\033[93m",
@@ -1264,7 +1247,7 @@ def periodic_status_update(stop_event, namespace):
             print_colored(f"\rCurrent status: {pod_count} pods created", "cyan", end='')
         else:
             if "No resources found" in error:
-                print_colored(f"\rWaiting for pods to be created... Do not panic. This will take a moment", "yellow", end='')
+                print_colored("\rWaiting for pods to be created... Do not panic. This will take a moment", "yellow", end='')
             else:
                 print_colored(f"\rError checking pod status: {error.strip()}", "red", end='')
         sys.stdout.flush()  # Ensure the output is displayed immediately
@@ -1400,6 +1383,5 @@ def health_check(namespace):
     return True
 
 if __name__ == "__main__":
-    install_certificates()
     installer = HopsworksInstaller()
     installer.run()
