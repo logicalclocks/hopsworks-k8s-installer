@@ -48,8 +48,8 @@ CLOUD_SPECIFIC_VALUES = {
         "global._hopsworks.managedDockerRegistery.enabled": "true",
         "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
         "global._hopsworks.managedDockerRegistery.credHelper.secretName": "awsregcred",
-        "global._hopsworks.managedDockerRegistery.domain": "${ECR_DOMAIN}",  # Will be templated
-        "global._hopsworks.managedDockerRegistery.namespace": "${NAMESPACE}", # Will be templated
+        "global._hopsworks.managedDockerRegistery.domain": "${domain}",  # Will be templated
+        "global._hopsworks.managedDockerRegistery.namespace": "${namespace}", # Will be templated
         "global._hopsworks.storageClassName": "ebs-gp3",
         "hopsworks.variables.docker_operations_managed_docker_secrets": "awsregcred",
         "hopsworks.variables.docker_operations_image_pull_secrets": "awsregcred",
@@ -63,20 +63,25 @@ CLOUD_SPECIFIC_VALUES = {
         }
     },
     "GCP": {
-            "global._hopsworks.cloudProvider": "GCP",
-            "global._hopsworks.managedDockerRegistery.enabled": "true",
-            "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
-            "global._hopsworks.managedDockerRegistery.credHelper.configMap": "docker-config",
-            "global._hopsworks.managedDockerRegistery.credHelper.secretName": "gcrregcred",
-            "hopsworks.variables.docker_operations_managed_docker_secrets": "gcrregcred",
-            "hopsworks.variables.docker_operations_image_pull_secrets": "gcrregcred",
-            "hopsworks.dockerRegistry.preset.secrets[0]": "gcrregcred",
-            "serviceAccount.name": "hopsworks-sa",
-            "serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account": None  
+        "global._hopsworks.cloudProvider": "GCP",
+        "global._hopsworks.managedDockerRegistery.enabled": "true",
+        "global._hopsworks.managedDockerRegistery.domain": "${region}-docker.pkg.dev",  
+        "global._hopsworks.managedDockerRegistery.namespace": "${project_id}/${registry_name}",  
+        "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
+        "global._hopsworks.managedDockerRegistery.credHelper.configMap": "docker-config",
+        "global._hopsworks.managedDockerRegistery.credHelper.secretName": "gcrregcred",
+        "hopsworks.variables.docker_operations_managed_docker_secrets": "gcrregcred",
+        "hopsworks.variables.docker_operations_image_pull_secrets": "gcrregcred",
+        "hopsworks.dockerRegistry.preset.secrets[0]": "gcrregcred",
+        "serviceAccount.name": "hopsworks-sa",
+        "serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account": "${sa_email}"  
+
     },
     "Azure": {
         "global._hopsworks.cloudProvider": "AZURE",
-        "global._hopsworks.managedDockerRegistry.enabled": "false",
+        "global._hopsworks.managedDockerRegistry.enabled": "true", # might need to set to false
+        "global._hopsworks.managedDockerRegistery.domain": "${registry_domain}",   # might need to remove
+        "global._hopsworks.managedDockerRegistery.namespace": "${registry_namespace}",  # might need to remove
         "global._hopsworks.ingressController.type": "none",
         "global._hopsworks.imagePullSecretName": "regcred",
         "global._hopsworks.minio.enabled": "true", 
