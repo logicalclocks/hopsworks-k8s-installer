@@ -48,8 +48,6 @@ CLOUD_SPECIFIC_VALUES = {
         "global._hopsworks.managedDockerRegistery.enabled": "true",
         "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
         "global._hopsworks.managedDockerRegistery.credHelper.secretName": "awsregcred",
-        "global._hopsworks.managedDockerRegistery.domain": "${domain}",  # Will be templated
-        "global._hopsworks.managedDockerRegistery.namespace": "${namespace}", # Will be templated
         "global._hopsworks.storageClassName": "ebs-gp3",
         "hopsworks.variables.docker_operations_managed_docker_secrets": "awsregcred",
         "hopsworks.variables.docker_operations_image_pull_secrets": "awsregcred",
@@ -65,23 +63,17 @@ CLOUD_SPECIFIC_VALUES = {
     "GCP": {
         "global._hopsworks.cloudProvider": "GCP",
         "global._hopsworks.managedDockerRegistery.enabled": "true",
-        "global._hopsworks.managedDockerRegistery.domain": "${region}-docker.pkg.dev",  
-        "global._hopsworks.managedDockerRegistery.namespace": "${project_id}/${registry_name}",  
         "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
         "global._hopsworks.managedDockerRegistery.credHelper.configMap": "docker-config",
         "global._hopsworks.managedDockerRegistery.credHelper.secretName": "gcrregcred",
         "hopsworks.variables.docker_operations_managed_docker_secrets": "gcrregcred",
         "hopsworks.variables.docker_operations_image_pull_secrets": "gcrregcred",
         "hopsworks.dockerRegistry.preset.secrets[0]": "gcrregcred",
-        "serviceAccount.name": "hopsworks-sa",
-        "serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account": "${sa_email}"  
-
+        "serviceAccount.name": "hopsworks-sa"
     },
     "Azure": {
         "global._hopsworks.cloudProvider": "AZURE",
-        "global._hopsworks.managedDockerRegistry.enabled": "true", # might need to set to false
-        "global._hopsworks.managedDockerRegistery.domain": "${registry_domain}",   # might need to remove
-        "global._hopsworks.managedDockerRegistery.namespace": "${registry_namespace}",  # might need to remove
+        "global._hopsworks.managedDockerRegistry.enabled": "true",
         "global._hopsworks.ingressController.type": "none",
         "global._hopsworks.imagePullSecretName": "regcred",
         "global._hopsworks.minio.enabled": "true", 
@@ -206,67 +198,80 @@ class HopsworksInstaller:
             self.finalize_installation()
                 
     def construct_helm_command(self):
-        """Constructs the helm command with proper configuration"""
-        # Base helm command
-        helm_command = [
-            "helm upgrade --install hopsworks-release hopsworks/hopsworks",
-            f"--namespace={self.namespace}",
-            "--create-namespace",
-            "--values hopsworks/values.yaml"
-        ]
-        
-        # Helper function to flatten nested dictionaries
-        def flatten_dict(d, parent_key='', sep='.'):
-            items = []
-            for k, v in d.items():
-                new_key = f"{parent_key}{sep}{k}" if parent_key else k
-                if isinstance(v, dict):
-                    items.extend(flatten_dict(v, new_key, sep=sep).items())
+            """Constructs the helm command with proper configuration"""
+            # Base helm command
+            helm_command = [
+                "helm upgrade --install hopsworks-release hopsworks/hopsworks",
+                f"--namespace={self.namespace}",
+                "--create-namespace",
+                "--values hopsworks/values.yaml"
+            ]
+            
+            # Helper function to flatten nested dictionaries
+            def flatten_dict(d, parent_key='', sep='.'):
+                items = []
+                for k, v in d.items():
+                    new_key = f"{parent_key}{sep}{k}" if parent_key else k
+                    if isinstance(v, dict):
+                        items.extend(flatten_dict(v, new_key, sep=sep).items())
+                    else:
+                        items.append((new_key, v))
+                return dict(items)
+
+            # Start with base config
+            helm_values = HELM_BASE_CONFIG.copy()
+            
+            # Add cloud-specific values
+            if self.environment in CLOUD_SPECIFIC_VALUES:
+                cloud_config = CLOUD_SPECIFIC_VALUES[self.environment].copy()
+                
+                # Handle registry values for each cloud provider
+                if self.environment == "AWS" and self.managed_registry_info:
+                    cloud_config.update({
+                        "global._hopsworks.managedDockerRegistery.domain": self.managed_registry_info['domain'],
+                        "global._hopsworks.managedDockerRegistery.namespace": self.managed_registry_info['namespace']
+                    })
+                    
+                elif self.environment == "GCP" and self.managed_registry_info:
+                    cloud_config.update({
+                        "global._hopsworks.managedDockerRegistery.domain": self.managed_registry_info['domain'],
+                        "global._hopsworks.managedDockerRegistery.namespace": self.managed_registry_info['namespace'],
+                        "serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account": self.sa_email
+                    })
+                    
+                elif self.environment == "Azure" and hasattr(self, 'registry_secrets_created'):
+                    # Azure uses regcred secret which is already configured in base cloud config
+                    # We only need to verify the secret exists, which we track with registry_secrets_created
+                    if not self.registry_secrets_created:
+                        print_colored("Warning: Azure registry secrets not properly configured", "yellow")
+                
+                helm_values.update(cloud_config)
+
+            # Flatten nested structures
+            flat_values = flatten_dict(helm_values)
+            
+            # Add each value with proper escaping and formatting
+            for key, value in flat_values.items():
+                if value is None:
+                    value = "null"
+                elif isinstance(value, bool):
+                    value = str(value).lower()
+                elif isinstance(value, (int, float)):
+                    value = str(value)
                 else:
-                    items.append((new_key, v))
-            return dict(items)
+                    # Escape special characters in string values
+                    value = f'"{str(value)}"'
+                
+                helm_command.append(f"--set {key}={value}")
 
-        # Start with base config
-        helm_values = HELM_BASE_CONFIG.copy()
-        
-        # Add cloud-specific values
-        if self.environment in CLOUD_SPECIFIC_VALUES:
-            cloud_config = CLOUD_SPECIFIC_VALUES[self.environment].copy()
-            
-            # Handle dynamic registry values for AWS
-            if self.environment == "AWS" and self.managed_registry_info:
-                cloud_config.update({
-                    "global._hopsworks.managedDockerRegistery.domain": self.managed_registry_info['domain'],
-                    "global._hopsworks.managedDockerRegistery.namespace": self.managed_registry_info['namespace']
-                })
-            
-            helm_values.update(cloud_config)
+            # Add timeout and devel flag
+            helm_command.extend([
+                "--timeout 60m",
+                "--devel"
+            ])
 
-        # Flatten nested structures
-        flat_values = flatten_dict(helm_values)
-        
-        # Add each value with proper escaping and formatting
-        for key, value in flat_values.items():
-            if value is None:
-                value = "null"
-            elif isinstance(value, bool):
-                value = str(value).lower()
-            elif isinstance(value, (int, float)):
-                value = str(value)
-            else:
-                # Escape special characters in string values
-                value = f'"{str(value)}"'
-            
-            helm_command.append(f"--set {key}={value}")
-
-        # Add timeout and devel flag
-        helm_command.extend([
-            "--timeout 60m",
-            "--devel"
-        ])
-
-        return " ".join(helm_command)
-            
+            return " ".join(helm_command)
+                    
     def setup_aws_prerequisites(self):
         """Enhanced AWS prerequisites setup with proper load balancer support"""
         print_colored("\nSetting up AWS prerequisites...", "blue")
@@ -1103,22 +1108,26 @@ subjects:
         print_colored(f"ECR repository set up: {repo_uri}", "green")
 
     def setup_gke_registry(self):
-        """Setup Artifact Registry"""
-        try:
-            registry_name = f"hopsworks-{self.cluster_name}"
-            # Just confirm the repo exists
-            run_command(f"gcloud artifacts repositories describe {registry_name} "
-                        f"--location={self.region} "
-                        f"--project={self.project_id}")
-            self.managed_registry_info = {
-                "domain": f"{self.region}-docker.pkg.dev",
-                "namespace": f"{self.project_id}/{registry_name}"
-            }
-            return True
+            """Setup Artifact Registry"""
+            try:
+                timestamp = int(time.time())
+                registry_name = f"hopsworks-{self.cluster_name}-{timestamp}"
+                
+                # Create Artifact Registry repository
+                run_command(f"gcloud artifacts repositories create {registry_name} "
+                            f"--repository-format=docker "
+                            f"--location={self.region} "
+                            f"--project={self.project_id}")
 
-        except Exception as e:
-            print_colored(f"Error during GCP Artifact Registry setup: {str(e)}", "red")
-            return False
+                self.managed_registry_info = {
+                    "domain": f"{self.region}-docker.pkg.dev",
+                    "namespace": f"{self.project_id}/{registry_name}"
+                }
+                return True
+
+            except Exception as e:
+                print_colored(f"Error during GCP Artifact Registry setup: {str(e)}", "red")
+                return False
 
     def handle_license_and_user_data(self):
         if not self.args.skip_license:
