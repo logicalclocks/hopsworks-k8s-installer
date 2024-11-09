@@ -1324,7 +1324,7 @@ def send_user_data(name, email, company, license_type, agreed_to_license):
     
 def wait_for_deployment(namespace, timeout=1200):
     """
-    Simple but effective deployment monitor focusing on core services.
+    Enhanced deployment monitor that handles various job completion patterns.
     """
     print_colored("\nMonitoring core services...", "blue")
     start_time = time.time()
@@ -1342,19 +1342,40 @@ def wait_for_deployment(namespace, timeout=1200):
                 break
         
         # Check jobs completion
-        cmd = f"kubectl get jobs -n {namespace} --no-headers | awk '{{print $2}}'"
+        cmd = f"kubectl get jobs -n {namespace} -o custom-columns=NAME:.metadata.name,COMPLETIONS:.status.succeeded,DESIRED:.spec.completions,STATUS:.status.conditions[*].type"
         success, output, _ = run_command(cmd, verbose=False)
-        jobs_done = 0
+        
         if success and output.strip():
-            jobs = output.strip().split('\n')
+            jobs = [line.split() for line in output.strip().split('\n')[1:]]  # Skip header
             total_jobs = len(jobs)
-            # Count jobs that show "1/1" completion
-            jobs_done = len([j for j in jobs if j == "1/1"])
+            jobs_done = 0
+            
+            for job in jobs:
+                name, completions, desired, status = job[0], job[1], job[2], job[3] if len(job) > 3 else ""
+                
+                # Handle special cases
+                if name == "preset-hopsworks-images-hopsworks-release1":
+                    # Special handling for preset job
+                    if completions != "<none>" and desired != "<none>":
+                        progress = float(completions) / float(desired)
+                        jobs_done += progress
+                    continue
+                
+                # Handle jobs with "0/0" pattern or "1/0" pattern
+                if desired == "0" or desired == "<none>":
+                    if status == "Complete" or completions == "1":
+                        jobs_done += 1
+                    continue
+                
+                # Regular jobs
+                if completions != "<none>" and int(completions) > 0:
+                    jobs_done += 1
+            
             progress = (jobs_done / total_jobs * 100)
-            
             elapsed = int(time.time() - start_time)
-            print_colored(f"\rProgress: {progress:.1f}% ({jobs_done}/{total_jobs} jobs) | {elapsed}s elapsed", "cyan", end='')
+            print_colored(f"\rProgress: {progress:.1f}% ({jobs_done:.1f}/{total_jobs} jobs) | {elapsed}s elapsed", "cyan", end='')
             
+            # Consider deployment ready when core services are up and most jobs are complete
             if ready and progress > 85:
                 print("\n")
                 print_colored("Core services are ready!", "green")
@@ -1365,6 +1386,18 @@ def wait_for_deployment(namespace, timeout=1200):
     
     print_colored(f"\nTimeout after {timeout/60:.1f} minutes.", "red")
     return False
+
+def health_check(namespace):
+    print_colored("\nPerforming basic health check...", "blue")
+
+    cmd = f"kubectl get pods -n {namespace} -o jsonpath='{{.items[*].status.phase}}'"
+    success, output, _ = run_command(cmd, verbose=False)
+    if not success or 'Running' not in output:
+        print_colored("Not all pods are in Running state. Health check failed.", "red")
+        return False
+
+    print_colored("Basic health check passed.", "green")
+    return True
 
 if __name__ == "__main__":
     install_certificates()
