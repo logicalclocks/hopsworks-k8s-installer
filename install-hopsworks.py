@@ -1305,7 +1305,7 @@ def send_user_data(name, email, company, license_type, agreed_to_license):
         print_colored(f"Failed to send user data: {str(e)}", "red")
         return False, installation_id
     
-def wait_for_deployment(namespace, timeout=1200):
+def wait_for_deployment(namespace, timeout=2700):
     """
     Enhanced deployment monitor that handles various job completion patterns.
     """
