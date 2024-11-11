@@ -1309,10 +1309,10 @@ def wait_for_deployment(namespace, timeout=1200):
     """
     Enhanced deployment monitor that handles various job completion patterns.
     """
-    print_colored("\nMonitoring core services...", "blue")
+    print_colored("\nMonitoring core services (may take a little while)...", "blue")
     start_time = time.time()
     
-    core_services = ["hopsworks-instance"]
+    core_services = ["hopsworks-instance, onlinefs-setup"]
     
     while (time.time() - start_time) < timeout:
         # Check our core pods
