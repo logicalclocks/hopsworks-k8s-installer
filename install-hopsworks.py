@@ -889,15 +889,61 @@ subjects:
             return False
         
     def setup_and_verify_kubeconfig(self):
-        while True:
-            self.kubeconfig_path, self.cluster_name, self.region = self.setup_kubeconfig()
-            if self.kubeconfig_path:
-                if self.verify_kubeconfig():
-                    break
-            else:
-                print_colored("Failed to set up a valid kubeconfig.", "red")
-                if not get_user_input("Do you want to try again? (yes/no):", ["yes", "no"]).lower() == "yes":
-                    sys.exit(1)
+        """Setup and verify kubeconfig with proper context switching"""
+        print_colored("\nSetting up kubeconfig...", "blue")
+        
+        kubeconfig_path = input("Enter the path to your kubeconfig file: ").strip()
+        kubeconfig_path = os.path.expanduser(kubeconfig_path)
+        
+        if not os.path.exists(kubeconfig_path):
+            print_colored(f"The file {kubeconfig_path} does not exist.", "red")
+            return False
+            
+        # Set the KUBECONFIG environment variable
+        os.environ['KUBECONFIG'] = kubeconfig_path
+        
+        # Get available contexts
+        success, output, error = run_command("kubectl config get-contexts -o name", verbose=False)
+        if not success:
+            print_colored(f"Failed to get contexts: {error}", "red")
+            return False
+            
+        contexts = output.strip().split('\n')
+        if not contexts:
+            print_colored("No contexts found in kubeconfig", "red")
+            return False
+            
+        # If there's only one context, use it
+        if len(contexts) == 1:
+            context = contexts[0]
+        else:
+            print_colored("\nAvailable contexts:", "cyan")
+            for i, ctx in enumerate(contexts, 1):
+                print(f"{i}. {ctx}")
+            choice = get_user_input("Select context number:", [str(i) for i in range(1, len(contexts) + 1)])
+            context = contexts[int(choice) - 1]
+        
+        # Switch to the selected context
+        success, _, error = run_command(f"kubectl config use-context {context}")
+        if not success:
+            print_colored(f"Failed to switch context: {error}", "red")
+            return False
+        
+        print_colored(f"Successfully switched to context: {context}", "green")
+        
+        # Verify we can access the cluster
+        success, _, error = run_command("kubectl get nodes")
+        if not success:
+            print_colored(f"Failed to access cluster: {error}", "red")
+            return False
+        
+        # Save for shell usage (still helpful for user)
+        with open('set_kubeconfig.sh', 'w') as f:
+            f.write(f"export KUBECONFIG={kubeconfig_path}\n")
+        print("\nFor future shell usage, run:")
+        print("source set_kubeconfig.sh")
+        
+        return True
 
     def setup_kubeconfig(self):
         print_colored(f"\nSetting up kubeconfig for {self.environment}...", "blue")
@@ -1142,28 +1188,45 @@ subjects:
             status_thread.join()
                                         
     def get_load_balancer_address(self):
-        """Get LoadBalancer address with cloud-specific formats"""
-        # First attempt - direct service check
-        if self.environment == "AWS":
-            cmd = "kubectl get svc -n {} hopsworks-release -o jsonpath='{{.status.loadBalancer.ingress[0].hostname}}'".format(self.namespace)
-        else:  # GCP, Azure, OVH all use IP
-            cmd = "kubectl get svc -n {} hopsworks-release -o jsonpath='{{.status.loadBalancer.ingress[0].ip}}'".format(self.namespace)
+        """Get LoadBalancer address with more robust detection"""
+        # Try both hostname and IP - some providers might give either
+        commands = [
+            "kubectl get svc -n {ns} hopsworks-release -o jsonpath='{{.status.loadBalancer.ingress[0].hostname}}'",
+            "kubectl get svc -n {ns} hopsworks-release -o jsonpath='{{.status.loadBalancer.ingress[0].ip}}'"
+        ]
         
-        success, address, _ = run_command(cmd, verbose=False)
-        if success and address.strip():
-            return address.strip()
-            
+        for cmd in commands:
+            formatted_cmd = cmd.format(ns=self.namespace)
+            success, output, _ = run_command(formatted_cmd, verbose=False)
+            if success and output.strip():
+                return output.strip()
+                
         # Fallback - check all LoadBalancer services
         print_colored("Retrying LoadBalancer address detection...", "yellow")
-        cmd = "kubectl get svc -n {} -o wide | grep LoadBalancer | grep hopsworks-release".format(self.namespace)
+        cmd = f"kubectl get svc -n {self.namespace} -o wide | grep LoadBalancer | grep hopsworks-release"
         success, output, _ = run_command(cmd, verbose=False)
         
         if success and output.strip():
-            # Parse the output to get the EXTERNAL-IP
             parts = output.split()
             if len(parts) >= 6:  # Standard kubectl output format
-                return parts[5]  # EXTERNAL-IP column
+                external_ip = parts[5]
+                if external_ip != '<pending>' and external_ip != '<none>':
+                    return external_ip
         
+        # Last resort - get ALL LoadBalancer services
+        cmd = f"kubectl get svc -n {self.namespace} --field-selector type=LoadBalancer -o json"
+        success, output, _ = run_command(cmd, verbose=False)
+        if success:
+            import json
+            try:
+                services = json.loads(output)
+                for svc in services.get('items', []):
+                    ingress = svc.get('status', {}).get('loadBalancer', {}).get('ingress', [])
+                    if ingress:
+                        return ingress[0].get('hostname') or ingress[0].get('ip')
+            except json.JSONDecodeError:
+                pass
+                
         return None
 
     def finalize_installation(self):
