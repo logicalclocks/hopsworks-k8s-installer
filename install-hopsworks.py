@@ -889,62 +889,18 @@ subjects:
             return False
         
     def setup_and_verify_kubeconfig(self):
-        """Setup and verify kubeconfig with proper context switching"""
-        print_colored("\nSetting up kubeconfig...", "blue")
-        
-        kubeconfig_path = input("Enter the path to your kubeconfig file: ").strip()
-        kubeconfig_path = os.path.expanduser(kubeconfig_path)
-        
-        if not os.path.exists(kubeconfig_path):
-            print_colored(f"The file {kubeconfig_path} does not exist.", "red")
-            return False
-            
-        # Set the KUBECONFIG environment variable
-        os.environ['KUBECONFIG'] = kubeconfig_path
-        
-        # Get available contexts
-        success, output, error = run_command("kubectl config get-contexts -o name", verbose=False)
-        if not success:
-            print_colored(f"Failed to get contexts: {error}", "red")
-            return False
-            
-        contexts = output.strip().split('\n')
-        if not contexts:
-            print_colored("No contexts found in kubeconfig", "red")
-            return False
-            
-        # If there's only one context, use it
-        if len(contexts) == 1:
-            context = contexts[0]
-        else:
-            print_colored("\nAvailable contexts:", "cyan")
-            for i, ctx in enumerate(contexts, 1):
-                print(f"{i}. {ctx}")
-            choice = get_user_input("Select context number:", [str(i) for i in range(1, len(contexts) + 1)])
-            context = contexts[int(choice) - 1]
-        
-        # Switch to the selected context
-        success, _, error = run_command(f"kubectl config use-context {context}")
-        if not success:
-            print_colored(f"Failed to switch context: {error}", "red")
-            return False
-        
-        print_colored(f"Successfully switched to context: {context}", "green")
-        
-        # Verify we can access the cluster
-        success, _, error = run_command("kubectl get nodes")
-        if not success:
-            print_colored(f"Failed to access cluster: {error}", "red")
-            return False
-        
-        # Save for shell usage (still helpful for user)
-        with open('set_kubeconfig.sh', 'w') as f:
-            f.write(f"export KUBECONFIG={kubeconfig_path}\n")
-        print("\nFor future shell usage, run:")
-        print("source set_kubeconfig.sh")
-        
-        return True
-
+        while True:
+            self.kubeconfig_path, self.cluster_name, self.region = self.setup_kubeconfig()
+            if self.kubeconfig_path:
+                # Set the provided config as current context
+                run_command(f"kubectl config use-context $(kubectl config current-context --kubeconfig={self.kubeconfig_path})")
+                if self.verify_kubeconfig():
+                    break
+            else:
+                print_colored("Failed to set up a valid kubeconfig.", "red")
+                if not get_user_input("Do you want to try again? (yes/no):", ["yes", "no"]).lower() == "yes":
+                    sys.exit(1)
+                    
     def setup_kubeconfig(self):
         print_colored(f"\nSetting up kubeconfig for {self.environment}...", "blue")
 
