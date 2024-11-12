@@ -254,9 +254,8 @@ class HopsworksInstaller:
             ])
 
             return " ".join(helm_command)
-                    
     def setup_aws_prerequisites(self):
-        """Enhanced AWS prerequisites setup with proper load balancer support"""
+        """Setup AWS prerequisites including metrics server"""
         print_colored("\nSetting up AWS prerequisites...", "blue")
         
         # 1. Basic AWS setup and verification
@@ -302,7 +301,7 @@ class HopsworksInstaller:
             print_colored("Failed to create ECR repository", "red")
             sys.exit(1)
 
-        # 4. Create enhanced IAM policy
+        # 4. Create IAM policy
         print_colored("\nCreating IAM policies...", "cyan")
         policy = {
             "Version": "2012-10-17",
@@ -311,18 +310,11 @@ class HopsworksInstaller:
                     "Sid": "HopsworksS3Access",
                     "Effect": "Allow",
                     "Action": [
-                        "S3:PutObject", 
-                        "S3:ListBucket", 
-                        "S3:GetObject", 
-                        "S3:DeleteObject",
-                        "S3:AbortMultipartUpload", 
-                        "S3:ListBucketMultipartUploads",
-                        "S3:PutLifecycleConfiguration", 
-                        "S3:GetLifecycleConfiguration",
-                        "S3:PutBucketVersioning",
-                        "S3:GetBucketVersioning",
-                        "S3:ListBucketVersions",
-                        "S3:DeleteObjectVersion"
+                        "S3:PutObject", "S3:ListBucket", "S3:GetObject", "S3:DeleteObject",
+                        "S3:AbortMultipartUpload", "S3:ListBucketMultipartUploads",
+                        "S3:PutLifecycleConfiguration", "S3:GetLifecycleConfiguration",
+                        "S3:PutBucketVersioning", "S3:GetBucketVersioning",
+                        "S3:ListBucketVersions", "S3:DeleteObjectVersion"
                     ],
                     "Resource": [
                         f"arn:aws:s3:::{bucket_name}/*",
@@ -333,56 +325,37 @@ class HopsworksInstaller:
                     "Sid": "HopsworksECRAccess",
                     "Effect": "Allow",
                     "Action": [
-                        "ecr:GetDownloadUrlForLayer",
-                        "ecr:BatchGetImage",
-                        "ecr:CompleteLayerUpload",
-                        "ecr:UploadLayerPart",
-                        "ecr:InitiateLayerUpload",
-                        "ecr:BatchCheckLayerAvailability",
-                        "ecr:PutImage",
-                        "ecr:ListImages",
-                        "ecr:BatchDeleteImage",
-                        "ecr:GetLifecyclePolicy",
-                        "ecr:PutLifecyclePolicy",
+                        "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage",
+                        "ecr:CompleteLayerUpload", "ecr:UploadLayerPart",
+                        "ecr:InitiateLayerUpload", "ecr:BatchCheckLayerAvailability",
+                        "ecr:PutImage", "ecr:ListImages", "ecr:BatchDeleteImage",
+                        "ecr:GetLifecyclePolicy", "ecr:PutLifecyclePolicy",
                         "ecr:TagResource"
                     ],
-                    "Resource": [
-                        f"arn:aws:ecr:{self.region}:{self.aws_account_id}:repository/*/hopsworks-base"
-                    ]
+                    "Resource": [f"arn:aws:ecr:{self.region}:{self.aws_account_id}:repository/*/hopsworks-base"]
                 },
                 {
                     "Sid": "HopsworksECRAuthToken",
                     "Effect": "Allow",
-                    "Action": [
-                        "ecr:GetAuthorizationToken"
-                    ],
+                    "Action": ["ecr:GetAuthorizationToken"],
                     "Resource": "*"
                 },
                 {
                     "Sid": "LoadBalancerAccess",
                     "Effect": "Allow",
                     "Action": [
-                        "elasticloadbalancing:*",
-                        "ec2:CreateTags",
-                        "ec2:DeleteTags",
-                        "ec2:DescribeAccountAttributes",
-                        "ec2:DescribeAddresses",
-                        "ec2:DescribeInstances",
-                        "ec2:DescribeInternetGateways",
-                        "ec2:DescribeNetworkInterfaces",
-                        "ec2:DescribeSecurityGroups",
-                        "ec2:DescribeSubnets",
-                        "ec2:DescribeTags",
-                        "ec2:DescribeVpcs",
-                        "ec2:ModifyNetworkInterfaceAttribute",
-                        "iam:CreateServiceLinkedRole",
-                        "iam:ListServerCertificates",
+                        "elasticloadbalancing:*", "ec2:CreateTags", "ec2:DeleteTags",
+                        "ec2:DescribeAccountAttributes", "ec2:DescribeAddresses",
+                        "ec2:DescribeInstances", "ec2:DescribeInternetGateways",
+                        "ec2:DescribeNetworkInterfaces", "ec2:DescribeSecurityGroups",
+                        "ec2:DescribeSubnets", "ec2:DescribeTags", "ec2:DescribeVpcs",
+                        "ec2:ModifyNetworkInterfaceAttribute", 
+                        "ec2:DescribeInstanceTypes",        # Added for RSS management
+                        "ec2:DescribeInstanceTypeOfferings", # Added for RSS management
+                        "iam:CreateServiceLinkedRole", "iam:ListServerCertificates", 
                         "cognito-idp:DescribeUserPoolClient",
-                        "acm:ListCertificates",
-                        "acm:DescribeCertificate",
-                        "waf-regional:*",
-                        "wafv2:*",
-                        "shield:*"
+                        "acm:ListCertificates", "acm:DescribeCertificate",
+                        "waf-regional:*", "wafv2:*", "shield:*"
                     ],
                     "Resource": "*"
                 }
@@ -400,7 +373,7 @@ class HopsworksInstaller:
             sys.exit(1)
 
         print_colored("Waiting for policy to propagate...", "yellow")
-        time.sleep(10)  # Give AWS time to propagate the policy
+        time.sleep(10)
 
         # 5. Create EKS cluster configuration
         print_colored("\nCreating EKS cluster configuration...", "cyan")
@@ -458,20 +431,7 @@ class HopsworksInstaller:
             print_colored("Failed to create EKS cluster", "red")
             sys.exit(1)
 
-        # 7. Verify cluster is ready
-        print_colored("\nVerifying cluster readiness...", "cyan")
-        max_retries = 10
-        for i in range(max_retries):
-            cmd = "kubectl get nodes --no-headers"
-            success, output, _ = run_command(cmd, verbose=False)
-            if success and output.strip():
-                print_colored("Cluster nodes are ready!", "green")
-                break
-            if i < max_retries - 1:
-                print_colored(f"Waiting for nodes to be ready (attempt {i+1}/{max_retries})...", "yellow")
-                time.sleep(30)
-
-        # 8. Create GP3 storage class
+        # 7. Create GP3 storage class
         print_colored("\nCreating GP3 storage class...", "cyan")
         storage_class = {
             "apiVersion": "storage.k8s.io/v1",
@@ -495,19 +455,7 @@ class HopsworksInstaller:
             print_colored("Failed to create GP3 storage class", "red")
             sys.exit(1)
 
-        # 9. Set up Helm and verify
-        print_colored("\nVerifying Helm installation...", "cyan")
-        if not run_command("helm version")[0]:
-            print_colored("Helm is not installed or not properly configured", "red")
-            sys.exit(1)
-
-        # Add and update EKS Helm repo
-        if not run_command("helm repo add eks https://aws.github.io/eks-charts")[0]:
-            print_colored("Failed to add EKS Helm repo", "red")
-            sys.exit(1)
-        run_command("helm repo update eks")
-
-        # 10. Set up AWS Load Balancer Controller
+        # 8. Set up AWS Load Balancer Controller
         print_colored("\nSetting up AWS Load Balancer Controller...", "cyan")
         
         # Download and create ALB policy
@@ -552,7 +500,19 @@ class HopsworksInstaller:
             print_colored("Failed to install AWS Load Balancer Controller", "red")
             sys.exit(1)
 
-        # 11. Verify final deployment
+        # 9. Install and configure metrics server
+        print_colored("\nInstalling metrics server...", "cyan")
+        metrics_cmd = """
+        kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/high-availability-1.21+.yaml && \
+        kubectl patch deployment metrics-server -n kube-system --type=json \
+        -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
+        """
+        if not run_command(metrics_cmd)[0]:
+            print_colored("Failed to install metrics server. Some monitoring features might be limited.", "yellow")
+        else:
+            print_colored("Metrics server installed and patched for EKS.", "green")
+
+        # 10. Verify final deployment
         print_colored("\nVerifying AWS Load Balancer Controller deployment...", "cyan")
         max_retries = 12
         for i in range(max_retries):
@@ -565,7 +525,7 @@ class HopsworksInstaller:
                 print_colored(f"Waiting for controller to be ready (attempt {i+1}/{max_retries})...", "yellow")
                 time.sleep(10)
 
-        # 12. Cleanup temporary files
+        # 11. Cleanup temporary files
         for file in [f'policy-{timestamp}.json', f'eksctl-{timestamp}.yaml', f'storage-class-{timestamp}.yaml', 'iam_policy_alb.json']:
             if os.path.exists(file):
                 os.remove(file)
