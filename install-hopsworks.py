@@ -1267,68 +1267,111 @@ def send_user_data(name, email, company, license_type, agreed_to_license):
     
 def wait_for_deployment(namespace, timeout=2700):
     """
-    Enhanced deployment monitor that handles various job completion patterns.
+    Enhanced deployment monitor that exits immediately when ready,
+    or lets you override with a keypress.
     """
-    print_colored("\nMonitoring core services (may take a little while)...", "blue")
+    print_colored("\nMonitoring core services...", "blue")
     start_time = time.time()
     
-    core_services = ["hopsworks-instance, onlinefs-setup"]
+    import threading
+    import sys
+    if sys.platform != 'win32':
+        import termios
+        import tty
+
+    override_flag = threading.Event()
     
-    while (time.time() - start_time) < timeout:
-        # Check our core pods
-        ready = True
-        for svc in core_services:
+    def check_status():
+        """Check if deployment is ready"""
+        # Check jobs
+        cmd = f"kubectl get jobs -n {namespace} -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[*].type"
+        success, output, _ = run_command(cmd, verbose=False)
+        
+        if not success or not output.strip():
+            return False, 0, 0
+            
+        jobs = [line.split() for line in output.strip().split('\n')[1:]]
+        incomplete_jobs = [job[0] for job in jobs if "Complete" not in job[-1] and "SuccessCriteriaMet" not in job[-1]]
+        
+        # Check core services
+        services_ready = True
+        for svc in ["hopsworks-instance", "onlinefs-setup"]:
             cmd = f"kubectl get pods -n {namespace} -l app={svc} -o jsonpath='{{.items[0].status.phase}}'"
             success, status, _ = run_command(cmd, verbose=False)
             if not success or status.strip() != "Running":
-                ready = False
+                services_ready = False
                 break
-        
-        # Check jobs completion
-        cmd = f"kubectl get jobs -n {namespace} -o custom-columns=NAME:.metadata.name,COMPLETIONS:.status.succeeded,DESIRED:.spec.completions,STATUS:.status.conditions[*].type"
-        success, output, _ = run_command(cmd, verbose=False)
-        
-        if success and output.strip():
-            jobs = [line.split() for line in output.strip().split('\n')[1:]]  # Skip header
-            total_jobs = len(jobs)
-            jobs_done = 0
-            
-            for job in jobs:
-                name, completions, desired, status = job[0], job[1], job[2], job[3] if len(job) > 3 else ""
                 
-                # Handle special cases
-                if name == "preset-hopsworks-images-hopsworks-release1":
-                    # Special handling for preset job
-                    if completions != "<none>" and desired != "<none>":
-                        progress = float(completions) / float(desired)
-                        jobs_done += progress
-                    continue
-                
-                # Handle jobs with "0/0" pattern or "1/0" pattern
-                if desired == "0" or desired == "<none>":
-                    if status == "Complete" or completions == "1":
-                        jobs_done += 1
-                    continue
-                
-                # Regular jobs
-                if completions != "<none>" and int(completions) > 0:
-                    jobs_done += 1
-            
-            progress = (jobs_done / total_jobs * 100)
-            elapsed = int(time.time() - start_time)
-            print_colored(f"\rProgress: {progress:.1f}% ({jobs_done:.1f}/{total_jobs} jobs) | {elapsed}s elapsed", "cyan", end='')
-            
-            # Consider deployment ready when core services are up and most jobs are complete
-            if ready and progress > 85:
-                print("\n")
-                print_colored("Core services are ready!", "green")
-                print_colored("You can proceed (background tasks will continue)", "cyan")
-                return True
+        total_jobs = len(jobs)
+        complete_jobs = total_jobs - len(incomplete_jobs)
         
-        time.sleep(5)
+        return services_ready and not incomplete_jobs, complete_jobs, total_jobs
+
+    def key_listener():
+        """Listen for keypress to override"""
+        if sys.platform == 'win32':
+            import msvcrt
+            while not override_flag.is_set():
+                if msvcrt.kbhit():
+                    key = msvcrt.getch()
+                    if key == b'1':
+                        override_flag.set()
+                threading.Event().wait(0.1)
+        else:
+            old_settings = termios.tcgetattr(sys.stdin)
+            try:
+                tty.setcbreak(sys.stdin.fileno())
+                while not override_flag.is_set():
+                    if sys.stdin.read(1) == '1':
+                        override_flag.set()
+            finally:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+    # Start key listener in background
+    listener = threading.Thread(target=key_listener, daemon=True)
+    listener.start()
     
-    print_colored(f"\nTimeout after {timeout/60:.1f} minutes.", "red")
-    return False
+    print_colored("Press '1' at any time to proceed anyway", "yellow")
+    
+    try:
+        while True:
+            # Check for override
+            if override_flag.is_set():
+                print("\n")
+                print_colored("Override accepted - proceeding anyway!", "yellow")
+                return True
+                
+            # Check if we've timed out
+            if (time.time() - start_time) >= timeout:
+                print_colored(f"\nTimeout after {timeout/60:.1f} minutes.", "yellow")
+                print_colored("Press '1' to proceed anyway, or Ctrl+C to abort", "cyan")
+                # Wait for override or interrupt
+                while not override_flag.is_set():
+                    time.sleep(1)
+                print_colored("\nProceeding despite timeout!", "yellow")
+                return True
+                
+            # Regular status check
+            is_ready, complete_jobs, total_jobs = check_status()
+            
+            if is_ready:
+                print("\n")
+                print_colored("All jobs complete and core services are ready!", "green")
+                return True
+            
+            # Status update
+            elapsed = int(time.time() - start_time)
+            progress = (complete_jobs / total_jobs * 100) if total_jobs > 0 else 0
+            print_colored(f"\rProgress: {progress:.1f}% ({complete_jobs}/{total_jobs} jobs) | {elapsed}s elapsed | Press '1' to proceed", "cyan", end='')
+            
+            time.sleep(5)
+            
+    except KeyboardInterrupt:
+        print("\n")
+        print_colored("Installation interrupted. Check status manually with 'kubectl get pods,jobs -n hopsworks'", "yellow")
+        return False
+    finally:
+        override_flag.set()  # Stop the key listener
 
 def health_check(namespace):
     print_colored("\nPerforming basic health check...", "blue")
