@@ -1252,7 +1252,24 @@ def get_license_agreement():
 
 def get_user_info():
     print_colored("\nProvide the following information:", "blue")
-    return input("Your name: "), input("Your email address: "), input("Your company name: ")
+    
+    while True:
+        name = input("Your name: ").strip()
+        if len(name) < 2:
+            print_colored("Sorry, We need a real name, please.", "yellow")
+            continue
+            
+        email = input("Your email address: ").strip()
+        if not '@' in email or not '.' in email or len(email) < 5:
+            print_colored("That doesn't look like an email address. Please try again", "yellow")
+            continue
+            
+        company = input("Your company name (optional): ").strip()
+            
+        # If we get here, all inputs are valid
+        break
+        
+    return name, email, company
 
 def send_user_data(name, email, company, license_type, agreed_to_license):
     print_colored("\nSending user data...", "blue")
