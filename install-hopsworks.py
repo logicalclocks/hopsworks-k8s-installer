@@ -73,7 +73,7 @@ CLOUD_SPECIFIC_VALUES = {
     },
     "Azure": {
         "global._hopsworks.cloudProvider": "AZURE",
-        "global._hopsworks.managedDockerRegistry.enabled": "true",
+        "global._hopsworks.managedDockerRegistery.enabled": "true",
         "global._hopsworks.ingressController.type": "none",
         "global._hopsworks.imagePullSecretName": "regcred",
         "global._hopsworks.minio.enabled": "true", 
@@ -1329,9 +1329,9 @@ def wait_for_deployment(namespace, timeout=2700):
         jobs = [line.split() for line in output.strip().split('\n')[1:]]
         incomplete_jobs = [job[0] for job in jobs if "Complete" not in job[-1] and "SuccessCriteriaMet" not in job[-1]]
         
-        # Check core services
+        # Check core service(s)
         services_ready = True
-        for svc in ["hopsworks-instance", "onlinefs-setup"]:
+        for svc in ["hopsworks-instance"]:
             cmd = f"kubectl get pods -n {namespace} -l app={svc} -o jsonpath='{{.items[0].status.phase}}'"
             success, status, _ = run_command(cmd, verbose=False)
             if not success or status.strip() != "Running":
