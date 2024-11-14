@@ -14,11 +14,8 @@
 # If not, see <https://www.gnu.org/licenses/>.
 
 import boto3
-import botocore
 import click
 from typing import List, Dict, Any
-import time
-from datetime import datetime, timezone
 import sys
 
 class Colors:
