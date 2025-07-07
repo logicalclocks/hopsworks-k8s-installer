@@ -2,6 +2,7 @@ policy
 set_kubeconfig.sh
 installation_log.txt
 hopsworks
+hopsworks-helm
 mini
 eksctl-*.yaml
 policy-*.json

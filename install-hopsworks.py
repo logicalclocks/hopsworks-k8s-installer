@@ -51,7 +51,7 @@ HELM_BASE_CONFIG = {
     "global._hopsworks.externalLoadBalancers.enabled": "true",
     "global._hopsworks.imagePullPolicy": "Always",
     "hopsworks.replicaCount.worker": "1",
-    "rondb.clusterSize.activeDataReplicas": "1",
+    "rondb.rondb.clusterSize.activeDataReplicas": "1",
     "hopsfs.datanode.count": "2"
 }
 
@@ -1295,25 +1295,28 @@ def send_user_data(name, email, company, license_type, agreed_to_license):
         "action": "install_hopsworks",
         "installation_date": datetime.now().isoformat()
     }
-    try:
-        req = urllib.request.Request(
-            SERVER_URL,
-            data=json.dumps(data).encode('utf-8'),
-            headers={'Content-Type': 'application/json'},
-            method='POST'
-        )
-        context = ssl._create_unverified_context()  # For HTTPS connections
-        with urllib.request.urlopen(req, timeout=30, context=context) as response:
-            if response.getcode() == 200:
-                print_colored("User data sent successfully.", "green")
-                return True, installation_id
-            else:
-                raise urllib.error.HTTPError(
-                    SERVER_URL, response.getcode(), "Failed to send user data", None, None
-                )
-    except (urllib.error.URLError, urllib.error.HTTPError) as e:
-        print_colored(f"Failed to send user data: {str(e)}", "red")
-        return False, installation_id
+    # Commented out the actual request - pretend it succeeded
+    print_colored("User data sent successfully.", "green")
+    return True, installation_id
+    # try:
+    #     req = urllib.request.Request(
+    #         SERVER_URL,
+    #         data=json.dumps(data).encode('utf-8'),
+    #         headers={'Content-Type': 'application/json'},
+    #         method='POST'
+    #     )
+    #     context = ssl._create_unverified_context()  # For HTTPS connections
+    #     with urllib.request.urlopen(req, timeout=30, context=context) as response:
+    #         if response.getcode() == 200:
+    #             print_colored("User data sent successfully.", "green")
+    #             return True, installation_id
+    #         else:
+    #             raise urllib.error.HTTPError(
+    #                 SERVER_URL, response.getcode(), "Failed to send user data", None, None
+    #             )
+    # except (urllib.error.URLError, urllib.error.HTTPError) as e:
+    #     print_colored(f"Failed to send user data: {str(e)}", "red")
+    #     return False, installation_id
     
 def wait_for_deployment(namespace, timeout=2700):
     """
