@@ -16,13 +16,8 @@ import subprocess
 import time
 import sys
 import os
-import uuid
 import shutil
 import argparse
-from datetime import datetime
-import urllib.request
-import urllib.error
-import ssl
 import threading
 import boto3
 import json
@@ -38,7 +33,6 @@ HOPSWORKS_LOGO = """
 ╚═╝  ╚═╝    ╚═════╝    ╚═╝        ╚══════╝    ╚══╝╚══╝     ╚═════╝    ╚═╝  ╚═╝   ╚═╝  ╚═╝   ╚══════╝
 """
 
-SERVER_URL = "https://magiclex--hopsworks-installation-hopsworks-installation.modal.run/"
 KNOWN_NONFATAL_ERRORS = [
     "invalid ingress class: IngressClass.networking.k8s.io",
 ]
@@ -203,7 +197,6 @@ class HopsworksInstaller:
             self.region = None
             self.zone = None
             self.namespace = 'hopsworks'
-            self.installation_id = None
             self.args = None
 
             # GCP specific
