@@ -16,13 +16,8 @@ import subprocess
 import time
 import sys
 import os
-import uuid
 import shutil
 import argparse
-from datetime import datetime
-import urllib.request
-import urllib.error
-import ssl
 import threading
 import boto3
 import json
@@ -38,9 +33,6 @@ HOPSWORKS_LOGO = """
 ╚═╝  ╚═╝    ╚═════╝    ╚═╝        ╚══════╝    ╚══╝╚══╝     ╚═════╝    ╚═╝  ╚═╝   ╚═╝  ╚═╝   ╚══════╝
 """
 
-SERVER_URL = "https://magiclex--hopsworks-installation-hopsworks-installation.modal.run/"
-STARTUP_LICENSE_URL = "https://www.hopsworks.ai/startup-license"
-EVALUATION_LICENSE_URL = "https://www.hopsworks.ai/evaluation-license"
 KNOWN_NONFATAL_ERRORS = [
     "invalid ingress class: IngressClass.networking.k8s.io",
 ]
@@ -58,21 +50,14 @@ HELM_BASE_CONFIG = {
 CLOUD_SPECIFIC_VALUES = {
     "AWS": {
         "global._hopsworks.cloudProvider": "AWS",
-        "global._hopsworks.ingressController.type": "none",
         "global._hopsworks.managedDockerRegistery.enabled": "true",
         "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
         "global._hopsworks.managedDockerRegistery.credHelper.secretName": "awsregcred",
         "global._hopsworks.storageClassName": "ebs-gp3",
+        "global._hopsworks.externalLoadBalancers.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-scheme": "internet-facing",
         "hopsworks.variables.docker_operations_managed_docker_secrets": "awsregcred",
         "hopsworks.variables.docker_operations_image_pull_secrets": "awsregcred",
-        "hopsworks.dockerRegistry.preset.secrets[0]": "awsregcred",
-        "externalLoadBalancers": {
-            "enabled": True,
-            "class": None,
-            "annotations": {
-                "service.beta.kubernetes.io/aws-load-balancer-scheme": "internet-facing"
-            }
-        }
+        "hopsworks.dockerRegistry.preset.secrets[0]": "awsregcred"
     },
     "GCP": {
         "global._hopsworks.cloudProvider": "GCP",
@@ -80,21 +65,19 @@ CLOUD_SPECIFIC_VALUES = {
         "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
         "global._hopsworks.managedDockerRegistery.credHelper.configMap": "docker-config",
         "global._hopsworks.managedDockerRegistery.credHelper.secretName": "gcrregcred",
+        "global._hopsworks.serviceAccount.name": "hopsworks-sa",
         "hopsworks.variables.docker_operations_managed_docker_secrets": "gcrregcred",
         "hopsworks.variables.docker_operations_image_pull_secrets": "gcrregcred",
-        "hopsworks.dockerRegistry.preset.secrets[0]": "gcrregcred",
-        "serviceAccount.name": "hopsworks-sa"
+        "hopsworks.dockerRegistry.preset.secrets[0]": "gcrregcred"
     },
     "Azure": {
         "global._hopsworks.cloudProvider": "AZURE",
-        "global._hopsworks.managedDockerRegistery.enabled": "true",
-        "global._hopsworks.ingressController.type": "none",
-        "global._hopsworks.imagePullSecretName": "regcred",
-        "global._hopsworks.minio.enabled": "true", 
-        "serviceAccount.name": "hopsworks-sa",
-        "serviceAccount.create": "false",
-        "hopsworks.service.worker.external.https.type": "LoadBalancer",  
-        "hopsworks.service.worker.external.https.annotations.service\\.beta\\.kubernetes\\.io/azure-load-balancer-internal": "false"
+        "global._hopsworks.minio.enabled": "true",
+        "global._hopsworks.storageClassName": "managed-csi",
+        "global._hopsworks.imagePullSecrets[0].name": "regcred",
+        "global._hopsworks.serviceAccount.name": "hopsworks-sa",
+        "global._hopsworks.serviceAccount.create": "false",
+        "global._hopsworks.externalLoadBalancers.annotations.service\\.beta\\.kubernetes\\.io/azure-load-balancer-internal": "false"
     },
     "OVH": {
         "global._hopsworks.cloudProvider": "OVH"
@@ -127,12 +110,83 @@ def run_command(command, verbose=True):
     except Exception as e:
         return False, "", str(e)
 
-def get_user_input(prompt, options=None):
+def get_user_input(prompt, options=None, default=None, validator=None):
+    """Get validated user input with optional default and custom validation"""
+    if default:
+        prompt = f"{prompt} (default: {default})"
+
     while True:
         response = input(prompt + " ").strip()
-        if options is None or response.lower() in [option.lower() for option in options]:
-            return response
-        print_colored(f"Invalid input. Expected one of: {', '.join(options)}", "yellow")
+
+        # Handle default
+        if not response and default is not None:
+            return default
+
+        # Handle empty required input
+        if not response and default is None and options is None:
+            print_colored("This field is required. Please provide a value.", "yellow")
+            continue
+
+        # Handle options
+        if options and response.lower() not in [option.lower() for option in options]:
+            print_colored(f"Invalid input. Expected one of: {', '.join(options)}", "yellow")
+            continue
+
+        # Handle custom validator
+        if validator:
+            is_valid, error_msg = validator(response)
+            if not is_valid:
+                print_colored(error_msg, "yellow")
+                continue
+
+        return response
+
+def validate_cluster_name(name):
+    """Validate Kubernetes cluster name (DNS-1123 subdomain)"""
+    if not name:
+        return False, "Cluster name cannot be empty."
+    if len(name) > 63:
+        return False, "Cluster name must be 63 characters or less."
+    if not name.islower() or not all(c.isalnum() or c == '-' for c in name):
+        return False, "Cluster name must be lowercase and can only contain alphanumeric characters and hyphens."
+    if not name[0].isalnum() or not name[-1].isalnum():
+        return False, "Cluster name must start and end with an alphanumeric character."
+    return True, None
+
+def validate_bucket_name(name):
+    """Validate S3 bucket name"""
+    if not name:
+        return False, "Bucket name cannot be empty."
+    if len(name) < 3 or len(name) > 63:
+        return False, "Bucket name must be between 3 and 63 characters."
+    if any(c.isupper() for c in name):
+        return False, "Bucket name must be lowercase."
+    if not all(c.isalnum() or c in '-.' for c in name):
+        return False, "Bucket name can only contain lowercase letters, numbers, hyphens, and periods."
+    if name.startswith('-') or name.endswith('-') or name.startswith('.') or name.endswith('.'):
+        return False, "Bucket name cannot start or end with a hyphen or period."
+    return True, None
+
+def validate_non_empty(value):
+    """Simple non-empty validator"""
+    if not value or not value.strip():
+        return False, "This field cannot be empty."
+    return True, None
+
+def display_config_summary(config):
+    """Display configuration summary and ask for confirmation"""
+    print_colored("\n" + "="*60, "cyan")
+    print_colored("CONFIGURATION SUMMARY", "cyan")
+    print_colored("="*60, "cyan")
+
+    for key, value in config.items():
+        if value:  # Only show non-empty values
+            print(f"  {key}: {value}")
+
+    print_colored("="*60, "cyan")
+
+    confirm = get_user_input("\nProceed with this configuration? (yes/no)", options=["yes", "no"])
+    return confirm.lower() == "yes"
 
 # Main installer
 class HopsworksInstaller:
@@ -144,25 +198,38 @@ class HopsworksInstaller:
             self.region = None
             self.zone = None
             self.namespace = 'hopsworks'
-            self.installation_id = None
             self.args = None
-            
+
             # GCP specific
             self.project_id = None
             self.sa_email = None
             self.role_name = None
-            
+
             # Registry handling
             self.use_managed_registry = False
             self.managed_registry_info = None
-            
+
             # AWS specific
             self.aws_profile = None
             self.aws_account_id = None
             self.policy_name = None
-            
-            # Azure specific (if we need it later)
+
+            # Azure specific
             self.resource_group = None
+            self.registry_secrets_created = False
+
+            # Temp file tracking
+            self.temp_files = []
+
+    def cleanup_temp_files(self):
+        """Clean up all temporary files created during installation"""
+        for file in self.temp_files:
+            if os.path.exists(file):
+                try:
+                    os.remove(file)
+                    print_colored(f"Cleaned up temporary file: {file}", "cyan")
+                except Exception as e:
+                    print_colored(f"Warning: Could not remove {file}: {e}", "yellow")
 
     def run(self):
         print_colored(HOPSWORKS_LOGO, "white")
@@ -170,29 +237,34 @@ class HopsworksInstaller:
         self.check_required_tools()
         self.get_deployment_environment()
 
-        if not self.args.loadbalancer_only:
-            if self.environment == "GCP":
-                self.setup_gke_prerequisites()
-            elif self.environment == "AWS":
-                self.setup_aws_prerequisites()
-            elif self.environment == "Azure":
-                self.setup_aks_prerequisites()  # This will create the cluster
+        try:
+            if not self.args.loadbalancer_only:
+                if self.environment == "GCP":
+                    self.setup_gke_prerequisites()
+                elif self.environment == "AWS":
+                    self.setup_aws_prerequisites()
+                elif self.environment == "Azure":
+                    self.setup_aks_prerequisites()  # This will create the cluster
+                else:
+                    self.setup_and_verify_kubeconfig()  # Only for other environments
+
+                self.handle_managed_registry()
+                if self.install_hopsworks():
+                    print_colored("\nHopsworks installation completed.", "green")
+                    self.finalize_installation()
+                else:
+                    print_colored("Hopsworks installation failed. Please check the logs and try again.", "red")
+                    sys.exit(1)
             else:
-                self.setup_and_verify_kubeconfig()  # Only for other environments
-                
-            self.handle_managed_registry()
-            self.handle_license_and_user_data()
-            if self.install_hopsworks():
-                print_colored("\nHopsworks installation completed.", "green")
+                # For loadbalancer-only, we need to set up the necessary variables
+                self.namespace = self.args.namespace
+                self.setup_and_verify_kubeconfig()
                 self.finalize_installation()
-            else:
-                print_colored("Hopsworks installation failed. Please check the logs and try again.", "red")
-                sys.exit(1)
-        else:
-            # For loadbalancer-only, we need to set up the necessary variables
-            self.namespace = self.args.namespace
-            self.setup_and_verify_kubeconfig()
-            self.finalize_installation()
+        finally:
+            # Always cleanup temp files
+            if self.temp_files:
+                print_colored("\nCleaning up temporary files...", "cyan")
+                self.cleanup_temp_files()
                 
     def construct_helm_command(self):
             """Constructs the helm command with proper configuration"""
@@ -233,12 +305,11 @@ class HopsworksInstaller:
                     cloud_config.update({
                         "global._hopsworks.managedDockerRegistery.domain": self.managed_registry_info['domain'],
                         "global._hopsworks.managedDockerRegistery.namespace": self.managed_registry_info['namespace'],
-                        "serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account": self.sa_email
+                        "global._hopsworks.serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account": self.sa_email
                     })
                     
-                elif self.environment == "Azure" and hasattr(self, 'registry_secrets_created'):
+                elif self.environment == "Azure":
                     # Azure uses regcred secret which is already configured in base cloud config
-                    # We only need to verify the secret exists, which we track with registry_secrets_created
                     if not self.registry_secrets_created:
                         print_colored("Warning: Azure registry secrets not properly configured", "yellow")
                 
@@ -261,45 +332,84 @@ class HopsworksInstaller:
                 
                 helm_command.append(f"--set {key}={value}")
 
-            # Add timeout and devel flag
-            helm_command.extend([
-                "--timeout 60m",
-                "--devel"
-            ])
+            # Add timeout
+            helm_command.append("--timeout 60m")
+
+            # Add version if specified
+            if self.args.version:
+                helm_command.append(f"--version {self.args.version}")
+
+            # Add devel flag if requested
+            if self.args.devel:
+                helm_command.append("--devel")
 
             return " ".join(helm_command)
     def setup_aws_prerequisites(self):
         """Setup AWS prerequisites including metrics server"""
         print_colored("\nSetting up AWS prerequisites...", "blue")
-        
+
         # 1. Basic AWS setup and verification
-        self.aws_profile = input("Enter your AWS profile name (default: default): ").strip() or "default"
+        self.aws_profile = get_user_input("Enter your AWS profile name", default="default")
         os.environ['AWS_PROFILE'] = self.aws_profile
-        
+
         # Verify AWS credentials
+        print_colored("Verifying AWS credentials...", "cyan")
         cmd = f"aws sts get-caller-identity --profile {self.aws_profile}"
         if not run_command(cmd, verbose=False)[0]:
-            print_colored("AWS CLI not properly configured. Please run 'aws configure' first.", "red")
+            print_colored("AWS CLI not properly configured.", "red")
+            print_colored(f"Please run 'aws configure --profile {self.aws_profile}' and try again.", "yellow")
             sys.exit(1)
-        
+
         # Get basic info
         self.region = self.get_aws_region()
-        self.cluster_name = input("Enter your EKS cluster name: ").strip()
-        
+        self.cluster_name = get_user_input("Enter your EKS cluster name", validator=validate_cluster_name)
+
         # Get AWS account ID
         cmd = f"aws sts get-caller-identity --query Account --output text --profile {self.aws_profile}"
-        success, account_id, _ = run_command(cmd)
+        success, account_id, _ = run_command(cmd, verbose=False)
         if not success:
             print_colored("Failed to get AWS account ID.", "red")
             sys.exit(1)
         self.aws_account_id = account_id.strip()
 
-        # 2. Create S3 bucket
-        bucket_name = input("Enter S3 bucket name for Hopsworks data: ").strip()
+        # 2. Get S3 bucket name
+        bucket_name = get_user_input("Enter S3 bucket name for Hopsworks data", validator=validate_bucket_name)
+
+        # 3. Get cluster configuration
+        print_colored("\nCluster configuration...", "cyan")
+        instance_type = get_user_input("Enter instance type", default="m6i.2xlarge")
+        node_count = get_user_input("Enter number of nodes", default="4")
+
+        # Display summary and confirm
+        config_summary = {
+            "Cloud Provider": "AWS",
+            "AWS Profile": self.aws_profile,
+            "Region": self.region,
+            "Cluster Name": self.cluster_name,
+            "Instance Type": instance_type,
+            "Node Count": node_count,
+            "S3 Bucket": bucket_name,
+            "Namespace": self.namespace
+        }
+
+        if not display_config_summary(config_summary):
+            print_colored("Installation cancelled by user.", "yellow")
+            sys.exit(0)
+
+        # 4. Create S3 bucket (or use existing)
+        print_colored("\nCreating AWS resources...", "blue")
         cmd = f"aws s3 mb s3://{bucket_name} --region {self.region} --profile {self.aws_profile}"
-        if not run_command(cmd)[0]:
-            print_colored("Failed to create S3 bucket", "red")
-            sys.exit(1)
+        success, _, stderr = run_command(cmd)
+        if not success:
+            if "BucketAlreadyOwnedByYou" in stderr or "BucketAlreadyExists" in stderr:
+                print_colored(f"S3 bucket '{bucket_name}' already exists, using existing bucket.", "yellow")
+            else:
+                print_colored("Failed to create S3 bucket.", "red")
+                print_colored("Possible causes:", "yellow")
+                print("  - Bucket name already exists globally (owned by someone else)")
+                print("  - Insufficient IAM permissions")
+                print("  - Invalid bucket name format")
+                sys.exit(1)
         
         # Enable versioning on the bucket
         cmd = f"aws s3api put-bucket-versioning --bucket {bucket_name} --versioning-configuration Status=Enabled --profile {self.aws_profile}"
@@ -307,15 +417,7 @@ class HopsworksInstaller:
             print_colored("Failed to enable bucket versioning", "red")
             sys.exit(1)
 
-        # 3. Create ECR repository
-        print_colored("\nCreating ECR repository...", "cyan")
-        repo_name = f"{self.cluster_name}/hopsworks-base"
-        cmd = f"aws ecr create-repository --repository-name {repo_name} --profile {self.aws_profile} --region {self.region}"
-        if not run_command(cmd)[0]:
-            print_colored("Failed to create ECR repository", "red")
-            sys.exit(1)
-
-        # 4. Create IAM policy
+        # 3. Create IAM policy
         print_colored("\nCreating IAM policies...", "cyan")
         policy = {
             "Version": "2012-10-17",
@@ -377,11 +479,13 @@ class HopsworksInstaller:
         }
         
         timestamp = int(time.time())
-        with open(f'policy-{timestamp}.json', 'w') as f:
+        policy_file = f'policy-{timestamp}.json'
+        with open(policy_file, 'w') as f:
             json.dump(policy, f, indent=2)
+        self.temp_files.append(policy_file)
 
         self.policy_name = f"hopsworks-policy-{timestamp}"
-        cmd = f"aws iam create-policy --policy-name {self.policy_name} --policy-document file://policy-{timestamp}.json --profile {self.aws_profile}"
+        cmd = f"aws iam create-policy --policy-name {self.policy_name} --policy-document file://{policy_file} --profile {self.aws_profile}"
         if not run_command(cmd)[0]:
             print_colored("Failed to create IAM policy", "red")
             sys.exit(1)
@@ -391,9 +495,6 @@ class HopsworksInstaller:
 
         # 5. Create EKS cluster configuration
         print_colored("\nCreating EKS cluster configuration...", "cyan")
-        instance_type = input("Enter instance type (default: m6i.2xlarge): ").strip() or "m6i.2xlarge"
-        node_count = input("Enter number of nodes (default: 4): ").strip() or "4"
-
         cluster_config = {
             "apiVersion": "eksctl.io/v1alpha5",
             "kind": "ClusterConfig",
@@ -435,14 +536,20 @@ class HopsworksInstaller:
             }]
         }
 
-        with open(f'eksctl-{timestamp}.yaml', 'w') as f:
+        eksctl_file = f'eksctl-{timestamp}.yaml'
+        with open(eksctl_file, 'w') as f:
             yaml.dump(cluster_config, f)
+        self.temp_files.append(eksctl_file)
 
         # 6. Create EKS cluster
         print_colored("\nCreating EKS cluster (this will take 15-20 minutes)...", "cyan")
-        cmd = f"eksctl create cluster -f eksctl-{timestamp}.yaml --profile {self.aws_profile}"
+        cmd = f"eksctl create cluster -f {eksctl_file} --profile {self.aws_profile}"
         if not run_command(cmd)[0]:
-            print_colored("Failed to create EKS cluster", "red")
+            print_colored("Failed to create EKS cluster.", "red")
+            print_colored("Check eksctl output above for details. Common issues:", "yellow")
+            print("  - VPC or subnet limits reached")
+            print("  - Insufficient IAM permissions")
+            print("  - Instance type not available in region")
             sys.exit(1)
 
         # 7. Create GP3 storage class
@@ -462,10 +569,12 @@ class HopsworksInstaller:
             "reclaimPolicy": "Delete"
         }
         
-        with open(f'storage-class-{timestamp}.yaml', 'w') as f:
+        storage_file = f'storage-class-{timestamp}.yaml'
+        with open(storage_file, 'w') as f:
             yaml.dump(storage_class, f)
-        
-        if not run_command(f"kubectl apply -f storage-class-{timestamp}.yaml")[0]:
+        self.temp_files.append(storage_file)
+
+        if not run_command(f"kubectl apply -f {storage_file}")[0]:
             print_colored("Failed to create GP3 storage class", "red")
             sys.exit(1)
 
@@ -473,13 +582,15 @@ class HopsworksInstaller:
         print_colored("\nSetting up AWS Load Balancer Controller...", "cyan")
         
         # Download and create ALB policy
-        cmd = "curl -o iam_policy_alb.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.2/docs/install/iam_policy.json"
+        alb_policy_file = "iam_policy_alb.json"
+        cmd = f"curl -o {alb_policy_file} https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.2/docs/install/iam_policy.json"
         if not run_command(cmd)[0]:
             print_colored("Failed to download ALB policy", "red")
             sys.exit(1)
+        self.temp_files.append(alb_policy_file)
 
         alb_policy_name = f"AWSLoadBalancerControllerIAMPolicy-{self.cluster_name}-{timestamp}"
-        cmd = f"aws iam create-policy --policy-name {alb_policy_name} --policy-document file://iam_policy_alb.json --profile {self.aws_profile}"
+        cmd = f"aws iam create-policy --policy-name {alb_policy_name} --policy-document file://{alb_policy_file} --profile {self.aws_profile}"
         run_command(cmd)  # Ignore if policy exists
 
         # Create service account with explicit role
@@ -539,11 +650,6 @@ class HopsworksInstaller:
                 print_colored(f"Waiting for controller to be ready (attempt {i+1}/{max_retries})...", "yellow")
                 time.sleep(10)
 
-        # 11. Cleanup temporary files
-        for file in [f'policy-{timestamp}.json', f'eksctl-{timestamp}.yaml', f'storage-class-{timestamp}.yaml', 'iam_policy_alb.json']:
-            if os.path.exists(file):
-                os.remove(file)
-
         print_colored("\nAWS prerequisites setup completed successfully!", "green")
         return True
 
@@ -552,8 +658,9 @@ class HopsworksInstaller:
         print_colored("\nSetting up GKE prerequisites...", "blue")
 
         # 1. Get essential info first
-        self.project_id = input("Enter your GCP project ID: ").strip()
-        zone_input = input("Enter your GCP zone (e.g., europe-west1-b). Note: If you select a region like europe-west1, deployments will include all sub-zones (a, b, c), potentially multiplying node counts. Proceed with caution: ").strip()
+        self.project_id = get_user_input("Enter your GCP project ID", validator=validate_non_empty)
+        print_colored("Note: Use a specific zone (e.g., europe-west1-b) to avoid multi-zone deployments.", "yellow")
+        zone_input = get_user_input("Enter your GCP zone (e.g., europe-west1-b)", validator=validate_non_empty)
         self.zone = zone_input
         self.region = '-'.join(zone_input.split('-')[:-1])  # extract region from zone
 
@@ -563,6 +670,8 @@ class HopsworksInstaller:
         print_colored(f"Creating role '{self.role_name}'...", "cyan")
 
         role_file = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False)
+        self.temp_files.append(role_file.name)
+
         try:
             role_def = {
                 "title": "Hopsworks AI Instances",
@@ -574,8 +683,11 @@ class HopsworksInstaller:
                     "artifactregistry.repositories.get",
                     "artifactregistry.repositories.uploadArtifacts",
                     "artifactregistry.repositories.downloadArtifacts",
+                    "artifactregistry.repositories.list",
                     "artifactregistry.tags.list",
-                    "artifactregistry.repositories.list"
+                    "artifactregistry.tags.create",
+                    "artifactregistry.tags.delete",
+                    "artifactregistry.versions.delete"
                 ]
             }
             yaml.dump(role_def, role_file)
@@ -589,8 +701,9 @@ class HopsworksInstaller:
                 sys.exit(1)
             else:
                 print_colored(f"Role '{self.role_name}' created successfully.", "green")
-        finally:
-            os.unlink(role_file.name)
+        except Exception as e:
+            print_colored(f"Error creating role: {e}", "red")
+            sys.exit(1)
 
         # 3. Create/update service account
         sa_name = "hopsworksai-instances"
@@ -638,43 +751,55 @@ class HopsworksInstaller:
         else:
             print_colored(f"Role '{self.role_name}' bound to service account '{self.sa_email}'.", "green")
 
-        # 5. NOW we can create the cluster with the service account
-        self.cluster_name = input("Enter your GKE cluster name: ").strip() or "hopsworks-cluster"
-        node_count = input("Enter number of nodes (default: 5): ").strip() or "5"
-        machine_type = input("Enter machine type (default: n2-standard-8): ").strip() or "n2-standard-8"
+        # 5. Get cluster configuration
+        self.cluster_name = get_user_input("Enter your GKE cluster name", default="hopsworks-cluster", validator=validate_cluster_name)
+        node_count = get_user_input("Enter number of nodes", default="5")
+        machine_type = get_user_input("Enter machine type", default="n2-standard-8")
 
+        # Display summary and confirm
+        config_summary = {
+            "Cloud Provider": "GCP",
+            "Project ID": self.project_id,
+            "Zone": self.zone,
+            "Region": self.region,
+            "Cluster Name": self.cluster_name,
+            "Machine Type": machine_type,
+            "Node Count": node_count,
+            "Namespace": self.namespace
+        }
+
+        if not display_config_summary(config_summary):
+            print_colored("Installation cancelled by user.", "yellow")
+            sys.exit(0)
+
+        # 6. Create the cluster
+        print_colored("\nCreating GKE cluster (this will take 10-15 minutes)...", "blue")
         cluster_cmd = (f"gcloud container clusters create {self.cluster_name} "
                        f"--zone={self.zone} "
                        f"--machine-type={machine_type} "
                        f"--num-nodes={node_count} "
                        f"--enable-ip-alias "
+                       f"--workload-pool={self.project_id}.svc.id.goog "
                        f"--service-account={self.sa_email}")
-        
-        print_colored("Creating GKE cluster...", "cyan")
+
         if not run_command(cluster_cmd)[0]:
             print_colored("Failed to create GKE cluster.", "red")
+            print_colored("Check gcloud output above for details. Common issues:", "yellow")
+            print("  - Insufficient project quotas")
+            print("  - Machine type not available in zone")
+            print("  - Billing not enabled on project")
             sys.exit(1)
         else:
             print_colored(f"GKE cluster '{self.cluster_name}' created.", "green")
 
-        # 6. Configure kubectl
+        # 7. Configure kubectl
         print_colored("Configuring kubectl...", "cyan")
         run_command(f"gcloud container clusters get-credentials {self.cluster_name} "
                     f"--zone={self.zone} "
                     f"--project={self.project_id}")
 
-        # 7. Setup Artifact Registry
-        registry_name = f"hopsworks-{self.cluster_name}-{timestamp}"
-        print_colored("Creating Artifact Registry repository...", "cyan")
-        success, _, error = run_command(f"gcloud artifacts repositories create {registry_name} "
-                    f"--repository-format=docker "
-                    f"--location={self.region} "
-                    f"--project={self.project_id}")
-        if not success and "already exists" not in error:
-            print_colored(f"Failed to create Artifact Registry: {error}", "red")
-            sys.exit(1)
-        else:
-            print_colored(f"Artifact Registry repository '{registry_name}' created or already exists.", "green")
+        # 8. Store registry name for later use in setup_gke_registry
+        self._gke_registry_name = f"hopsworks-{self.cluster_name}-{timestamp}"
 
         # Now, set up GKE authentication
         self.setup_gke_authentication()
@@ -697,40 +822,41 @@ class HopsworksInstaller:
         # Annotate the K8s SA
         run_command(
             f"kubectl annotate serviceaccount -n {self.namespace} hopsworks-sa "
-            f"iam.gke.io/gcp-service-account={self.sa_email}"
+            f"iam.gke.io/gcp-service-account={self.sa_email} --overwrite"
         )
 
-        # 2. Setup Docker config for both GCP and hops.works registries
+        # 2. Setup Docker config for GCP Artifact Registry
         docker_config = {
             "credHelpers": {
-                f"{self.region}-docker.pkg.dev": "gcloud",
-                "docker.hops.works": "gcloud"
+                f"{self.region}-docker.pkg.dev": "gcloud"
             }
         }
 
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             json.dump(docker_config, f)
             config_file = f.name
+        self.temp_files.append(config_file)
 
         run_command(f"kubectl create configmap docker-config -n {self.namespace} "
                    f"--from-file=config.json={config_file} "
                    f"--dry-run=client -o yaml | kubectl apply -f -")
-        
-        os.unlink(config_file)
+
         return True
 
     def setup_aks_prerequisites(self):
         """Setup AKS prerequisites and cluster from scratch"""
         print_colored("\nSetting up AKS prerequisites...", "blue")
-        
+
         # Verify Azure CLI auth
+        print_colored("Verifying Azure CLI authentication...", "cyan")
         if not run_command("az account show", verbose=False)[0]:
-            print_colored("Please run 'az login' first.", "red")
+            print_colored("Azure CLI not authenticated.", "red")
+            print_colored("Please run 'az login' and try again.", "yellow")
             sys.exit(1)
 
         # Get resource group - create if doesn't exist
-        self.resource_group = input("Enter your Azure resource group name: ").strip()
-        location = input("Enter Azure region (eg. eastus): ").strip() or "eastus"
+        self.resource_group = get_user_input("Enter your Azure resource group name", validator=validate_non_empty)
+        location = get_user_input("Enter Azure region (e.g., eastus)", default="eastus")
         
         # Check if resource group exists, create if it doesn't
         if not run_command(f"az group show --name {self.resource_group}", verbose=False)[0]:
@@ -740,9 +866,24 @@ class HopsworksInstaller:
                 sys.exit(1)
 
         # Get cluster details
-        self.cluster_name = input("Enter your AKS cluster name: ").strip()
-        node_count = input("Enter number of nodes (default: 5): ").strip() or "5"
-        machine_type = input("Enter machine type (default: Standard_D8_v4): ").strip() or "Standard_D8_v4"
+        self.cluster_name = get_user_input("Enter your AKS cluster name", validator=validate_cluster_name)
+        node_count = get_user_input("Enter number of nodes", default="5")
+        machine_type = get_user_input("Enter machine type", default="Standard_D8_v4")
+
+        # Display summary and confirm
+        config_summary = {
+            "Cloud Provider": "Azure",
+            "Resource Group": self.resource_group,
+            "Location": location,
+            "Cluster Name": self.cluster_name,
+            "Machine Type": machine_type,
+            "Node Count": node_count,
+            "Namespace": self.namespace
+        }
+
+        if not display_config_summary(config_summary):
+            print_colored("Installation cancelled by user.", "yellow")
+            sys.exit(0)
 
         # Create AKS cluster with minimal config but all we need
         print_colored("\nCreating AKS cluster (this will take 5-10 minutes)...", "cyan")
@@ -765,16 +906,30 @@ class HopsworksInstaller:
             print_colored("Failed to start AKS cluster creation.", "red")
             sys.exit(1)
 
-        # Wait for cluster to be ready
+        # Wait for cluster to be ready with timeout
         print_colored("\nWaiting for cluster to be ready...", "cyan")
+        time.sleep(30)  # Initial delay after --no-wait to let Azure start provisioning
+
+        max_wait_time = 1800  # 30 minutes timeout
+        start_time = time.time()
+
         while True:
+            elapsed = time.time() - start_time
+            if elapsed > max_wait_time:
+                print_colored(f"Timeout waiting for AKS cluster after {max_wait_time // 60} minutes.", "red")
+                print_colored("Check Azure portal for cluster status.", "yellow")
+                sys.exit(1)
+
             success, output, _ = run_command(
                 f"az aks show --resource-group {self.resource_group} --name {self.cluster_name} --query provisioningState -o tsv",
                 verbose=False
             )
             if success and "Succeeded" in output:
                 break
-            print_colored("Still creating cluster...", "yellow")
+            if success and "Failed" in output:
+                print_colored("AKS cluster creation failed.", "red")
+                sys.exit(1)
+            print_colored(f"Still creating cluster... ({int(elapsed)}s elapsed)", "yellow")
             time.sleep(30)
 
         # Get credentials
@@ -808,10 +963,12 @@ subjects:
 - kind: ServiceAccount
   name: hopsworks-sa
   namespace: {self.namespace}"""
-        with open('sa.yaml', 'w') as f:
+        sa_file = 'sa.yaml'
+        with open(sa_file, 'w') as f:
             f.write(sa_yaml)
-        
-        run_command("kubectl apply -f sa.yaml")
+        self.temp_files.append(sa_file)
+
+        run_command(f"kubectl apply -f {sa_file}")
 
         print_colored("\nAKS prerequisites setup completed successfully!", "green")
         return True
@@ -819,19 +976,10 @@ subjects:
     def handle_azure_registry(self):
         """Setup Docker registry auth for Azure with proper error handling and verification"""
         print_colored("\nSetting up Docker registry credentials...", "blue")
-        
-        # Get Docker registry credentials with basic validation
-        while True:
-            docker_user = input("Enter your Hopsworks Docker registry username: ").strip()
-            if docker_user:
-                break
-            print_colored("Username cannot be empty.", "yellow")
-        
-        while True:
-            docker_pass = input("Enter your Hopsworks Docker registry password: ").strip()
-            if docker_pass:
-                break
-            print_colored("Password cannot be empty.", "yellow")
+
+        # Get Docker registry credentials with validation
+        docker_user = get_user_input("Enter your Hopsworks Docker registry username", validator=validate_non_empty)
+        docker_pass = get_user_input("Enter your Hopsworks Docker registry password", validator=validate_non_empty)
 
         # Define our secrets configuration
         registry_secrets = [
@@ -924,7 +1072,7 @@ subjects:
 
         if self.environment == "AWS":
             # Existing AWS logic
-            cluster_name = input("Enter your EKS cluster name: ").strip()
+            cluster_name = get_user_input("Enter your EKS cluster name", validator=validate_cluster_name)
             region = self.get_aws_region()
             cmd = f"aws eks get-token --cluster-name {cluster_name} --region {region}"
             if not run_command(cmd)[0]:
@@ -937,9 +1085,9 @@ subjects:
 
         elif self.environment == "GCP":
             if self.args.loadbalancer_only:
-                cluster_name = input("Enter your GKE cluster name: ").strip()
-                self.project_id = input("Enter your GCP project ID: ").strip()
-                zone_input = input("Enter your GCP zone (e.g. europe-west1-b): ").strip()
+                cluster_name = get_user_input("Enter your GKE cluster name", validator=validate_cluster_name)
+                self.project_id = get_user_input("Enter your GCP project ID", validator=validate_non_empty)
+                zone_input = get_user_input("Enter your GCP zone (e.g., europe-west1-b)", validator=validate_non_empty)
                 self.zone = zone_input
                 self.region = '-'.join(zone_input.split('-')[:-1])  # extract region from zone
             else:
@@ -955,8 +1103,8 @@ subjects:
             kubeconfig_path = os.path.expanduser("~/.kube/config")
 
         elif self.environment == "Azure":
-            self.resource_group = input("Enter your Azure resource group name: ").strip()
-            cluster_name = input("Enter your AKS cluster name: ").strip()
+            self.resource_group = get_user_input("Enter your Azure resource group name", validator=validate_non_empty)
+            cluster_name = get_user_input("Enter your AKS cluster name", validator=validate_cluster_name)
             cmd = f"az aks get-credentials --resource-group {self.resource_group} --name {cluster_name} --overwrite-existing"
             if not run_command(cmd)[0]:
                 print_colored("Failed to get AKS credentials. Check your Azure CLI configuration and permissions.", "red")
@@ -964,11 +1112,19 @@ subjects:
             kubeconfig_path = os.path.expanduser("~/.kube/config")
 
         else:
-            # Other environments
-            kubeconfig_path = input("Enter the path to your kubeconfig file: ").strip()
+            # Other environments (OVH, etc.)
+            print_colored(f"\nFor {self.environment}, you need an existing Kubernetes cluster.", "blue")
+            print_colored("Make sure your cluster meets these requirements:", "cyan")
+            print("  - Kubernetes 1.24+")
+            print("  - LoadBalancer support")
+            print("  - Storage class configured")
+            print("  - At least 32GB RAM and 8 vCPUs total across nodes\n")
+
+            kubeconfig_path = get_user_input("Enter the path to your kubeconfig file", validator=validate_non_empty)
             kubeconfig_path = os.path.expanduser(kubeconfig_path)
             if not os.path.exists(kubeconfig_path):
-                print_colored(f"The file {kubeconfig_path} does not exist. Check the path and try again.", "red")
+                print_colored(f"The file {kubeconfig_path} does not exist.", "red")
+                print_colored("Check the path and try again.", "yellow")
                 return None, None, None
 
         if kubeconfig_path:
@@ -1016,9 +1172,9 @@ subjects:
     def parse_arguments(self):
         parser = argparse.ArgumentParser(description="Hopsworks Installation Script")
         parser.add_argument('--loadbalancer-only', action='store_true', help='Jump directly to the LoadBalancer setup')
-        parser.add_argument('--no-user-data', action='store_true', help='Skip sending user data')
-        parser.add_argument('--skip-license', action='store_true', help='Skip license agreement step')
         parser.add_argument('--namespace', default='hopsworks', help='Namespace for Hopsworks installation')
+        parser.add_argument('--devel', action='store_true', help='Enable development mode (use --devel flag with helm)')
+        parser.add_argument('--version', type=str, help='Specify Hopsworks version to install (e.g., 4.0.0)')
         self.args = parser.parse_args()
         self.namespace = self.args.namespace
 
@@ -1036,8 +1192,10 @@ subjects:
     def get_aws_region(self):
         region = os.environ.get('AWS_REGION')
         if not region:
-            region = input("Enter your AWS region (e.g., us-east-2): ").strip()
+            region = get_user_input("Enter your AWS region (e.g., us-east-2)", validator=validate_non_empty)
             os.environ['AWS_REGION'] = region
+        else:
+            print_colored(f"Using AWS region from environment: {region}", "cyan")
         return region
 
     def handle_managed_registry(self):
@@ -1050,6 +1208,9 @@ subjects:
             if not self.setup_gke_registry():
                 print_colored("GCP Artifact Registry setup failed. Cannot proceed with installation.", "red")
                 sys.exit(1)
+        elif self.environment == "Azure":
+            print_colored("Setting up Azure registry credentials...", "blue")
+            self.handle_azure_registry()
 
     def setup_aws_ecr(self):
         client = boto3.client('ecr', region_name=self.region)
@@ -1069,14 +1230,24 @@ subjects:
     def setup_gke_registry(self):
             """Setup Artifact Registry"""
             try:
-                timestamp = int(time.time())
-                registry_name = f"hopsworks-{self.cluster_name}-{timestamp}"
-                
+                # Use registry name from setup_gke_prerequisites if available, else generate new
+                registry_name = getattr(self, '_gke_registry_name', None)
+                if not registry_name:
+                    timestamp = int(time.time())
+                    registry_name = f"hopsworks-{self.cluster_name}-{timestamp}"
+
                 # Create Artifact Registry repository
-                run_command(f"gcloud artifacts repositories create {registry_name} "
+                print_colored(f"Creating Artifact Registry repository '{registry_name}'...", "cyan")
+                success, _, error = run_command(f"gcloud artifacts repositories create {registry_name} "
                             f"--repository-format=docker "
                             f"--location={self.region} "
                             f"--project={self.project_id}")
+
+                if not success and "already exists" not in error:
+                    print_colored(f"Failed to create Artifact Registry: {error}", "red")
+                    return False
+
+                print_colored(f"Artifact Registry repository '{registry_name}' ready.", "green")
 
                 self.managed_registry_info = {
                     "domain": f"{self.region}-docker.pkg.dev",
@@ -1087,23 +1258,6 @@ subjects:
             except Exception as e:
                 print_colored(f"Error during GCP Artifact Registry setup: {str(e)}", "red")
                 return False
-
-    def handle_license_and_user_data(self):
-        if not self.args.skip_license:
-            license_type, agreement = get_license_agreement()
-        else:
-            license_type, agreement = None, False
-
-        if not self.args.no_user_data:
-            name, email, company = get_user_info()
-            success, self.installation_id = send_user_data(name, email, company, license_type, agreement)
-            if success:
-                print_colored(f"Installation ID: {self.installation_id}", "green")
-            else:
-                print_colored("Failed to process user information. Continuing with installation.", "yellow")
-                self.installation_id = "unknown"
-        else:
-            self.installation_id = "debug_mode"
 
     def install_hopsworks(self):
         """Installs Hopsworks consistently across all cloud providers"""
@@ -1118,11 +1272,44 @@ subjects:
             print_colored("Failed to update Helm repos.", "red")
             return False
 
+        # Show available versions if user hasn't specified one
+        if not self.args.version:
+            print_colored("\nFetching available Hopsworks versions...", "cyan")
+            # Always use --devel to show all versions including RCs
+            search_cmd = "helm search repo hopsworks/hopsworks -l --devel"
+
+            success, output, _ = run_command(search_cmd, verbose=False)
+            if success and output.strip():
+                print_colored("\nAvailable versions:", "blue")
+                # Show only first 10 versions to avoid clutter
+                lines = output.strip().split('\n')
+                for line in lines[:11]:  # Header + 10 versions
+                    print(line)
+                if len(lines) > 11:
+                    print(f"... and {len(lines) - 11} more versions")
+
+                print_colored("\nYou can specify a version with --version flag, or press Enter to use the latest.", "yellow")
+                use_specific = get_user_input("Do you want to specify a version now? (yes/no)", options=["yes", "no"], default="no")
+
+                if use_specific.lower() == "yes":
+                    version = get_user_input("Enter version number", validator=validate_non_empty)
+                    self.args.version = version
+                    print_colored(f"Will install version: {version}", "green")
+            else:
+                print_colored("Could not fetch versions, continuing with latest...", "yellow")
+
         # Clean up and get fresh chart - this is good practice, keep it
         if os.path.exists('hopsworks'):
             shutil.rmtree('hopsworks', ignore_errors=True)
 
-        if not run_command("helm pull hopsworks/hopsworks --untar --devel")[0]:
+        # Build helm pull command
+        pull_cmd = "helm pull hopsworks/hopsworks --untar"
+        if self.args.version:
+            pull_cmd += f" --version {self.args.version}"
+        if self.args.devel:
+            pull_cmd += " --devel"
+
+        if not run_command(pull_cmd)[0]:
             print_colored("Failed to pull Hopsworks chart.", "red")
             return False
         
@@ -1247,77 +1434,6 @@ def periodic_status_update(stop_event, namespace):
         time.sleep(10)  # Update every 10 seconds
     print()  # Print a newline when done to move to the next line
 
-def get_license_agreement():
-    print_colored("\nChoose a license agreement:", "blue")
-    print("1. Startup Software License")
-    print("2. Evaluation Agreement")
-    choice = get_user_input("Enter 1 or 2:", ["1", "2"])
-    license_type = "Startup" if choice == "1" else "Evaluation"
-    license_url = STARTUP_LICENSE_URL if choice == "1" else EVALUATION_LICENSE_URL
-    print_colored(f"\nReview the {license_type} License Agreement at:", "blue")
-    print_colored(license_url, "cyan")
-    agreement = get_user_input(
-        "\nDo you agree to the terms and conditions? (yes/no):", ["yes", "no"]
-    ).lower() == "yes"
-    if not agreement:
-        print_colored("You must agree to the terms and conditions to proceed.", "red")
-        sys.exit(1)
-    return license_type, agreement
-
-def get_user_info():
-    print_colored("\nProvide the following information:", "blue")
-    
-    while True:
-        name = input("Your name: ").strip()
-        if len(name) < 2:
-            print_colored("Sorry, We need a real name, please.", "yellow")
-            continue
-            
-        email = input("Your email address: ").strip()
-        if not '@' in email or not '.' in email or len(email) < 5:
-            print_colored("That doesn't look like an email address. Please try again", "yellow")
-            continue
-            
-        company = input("Your company name (optional): ").strip()
-            
-        # If we get here, all inputs are valid
-        break
-        
-    return name, email, company
-
-def send_user_data(name, email, company, license_type, agreed_to_license):
-    print_colored("\nSending user data...", "blue")
-    installation_id = str(uuid.uuid4())
-    data = {
-        "name": name, "email": email, "company": company,
-        "license_type": license_type, "agreed_to_license": agreed_to_license,
-        "installation_id": installation_id,
-        "action": "install_hopsworks",
-        "installation_date": datetime.now().isoformat()
-    }
-    # Commented out the actual request - pretend it succeeded
-    print_colored("User data sent successfully.", "green")
-    return True, installation_id
-    # try:
-    #     req = urllib.request.Request(
-    #         SERVER_URL,
-    #         data=json.dumps(data).encode('utf-8'),
-    #         headers={'Content-Type': 'application/json'},
-    #         method='POST'
-    #     )
-    #     context = ssl._create_unverified_context()  # For HTTPS connections
-    #     with urllib.request.urlopen(req, timeout=30, context=context) as response:
-    #         if response.getcode() == 200:
-    #             print_colored("User data sent successfully.", "green")
-    #             return True, installation_id
-    #         else:
-    #             raise urllib.error.HTTPError(
-    #                 SERVER_URL, response.getcode(), "Failed to send user data", None, None
-    #             )
-    # except (urllib.error.URLError, urllib.error.HTTPError) as e:
-    #     print_colored(f"Failed to send user data: {str(e)}", "red")
-    #     return False, installation_id
-    
 def wait_for_deployment(namespace, timeout=2700):
     """
     Enhanced deployment monitor that exits immediately when ready,
