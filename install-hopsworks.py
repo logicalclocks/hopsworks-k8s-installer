@@ -214,8 +214,9 @@ class HopsworksInstaller:
             self.aws_account_id = None
             self.policy_name = None
 
-            # Azure specific (if we need it later)
+            # Azure specific
             self.resource_group = None
+            self.registry_secrets_created = False
 
             # Temp file tracking
             self.temp_files = []
@@ -307,9 +308,8 @@ class HopsworksInstaller:
                         "global._hopsworks.serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account": self.sa_email
                     })
                     
-                elif self.environment == "Azure" and hasattr(self, 'registry_secrets_created'):
+                elif self.environment == "Azure":
                     # Azure uses regcred secret which is already configured in base cloud config
-                    # We only need to verify the secret exists, which we track with registry_secrets_created
                     if not self.registry_secrets_created:
                         print_colored("Warning: Azure registry secrets not properly configured", "yellow")
                 
@@ -822,7 +822,7 @@ class HopsworksInstaller:
         # Annotate the K8s SA
         run_command(
             f"kubectl annotate serviceaccount -n {self.namespace} hopsworks-sa "
-            f"iam.gke.io/gcp-service-account={self.sa_email}"
+            f"iam.gke.io/gcp-service-account={self.sa_email} --overwrite"
         )
 
         # 2. Setup Docker config for GCP Artifact Registry
