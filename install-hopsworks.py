@@ -157,13 +157,15 @@ def get_user_input(prompt, options=None, default=None, validator=None):
         return response
 
 def validate_cluster_name(name):
-    """Validate Kubernetes cluster name"""
+    """Validate Kubernetes cluster name (DNS-1123 subdomain)"""
     if not name:
         return False, "Cluster name cannot be empty."
     if len(name) > 63:
         return False, "Cluster name must be 63 characters or less."
-    if not name.replace('-', '').replace('_', '').isalnum():
-        return False, "Cluster name can only contain alphanumeric characters, hyphens, and underscores."
+    if not name.islower() or not all(c.isalnum() or c == '-' for c in name):
+        return False, "Cluster name must be lowercase and can only contain alphanumeric characters and hyphens."
+    if not name[0].isalnum() or not name[-1].isalnum():
+        return False, "Cluster name must start and end with an alphanumeric character."
     return True, None
 
 def validate_bucket_name(name):
@@ -172,8 +174,12 @@ def validate_bucket_name(name):
         return False, "Bucket name cannot be empty."
     if len(name) < 3 or len(name) > 63:
         return False, "Bucket name must be between 3 and 63 characters."
-    if not name.replace('-', '').replace('.', '').isalnum():
+    if any(c.isupper() for c in name):
+        return False, "Bucket name must be lowercase."
+    if not all(c.isalnum() or c in '-.' for c in name):
         return False, "Bucket name can only contain lowercase letters, numbers, hyphens, and periods."
+    if name.startswith('-') or name.endswith('-') or name.startswith('.') or name.endswith('.'):
+        return False, "Bucket name cannot start or end with a hyphen or period."
     return True, None
 
 def validate_non_empty(value):
@@ -367,7 +373,7 @@ class HopsworksInstaller:
         cmd = f"aws sts get-caller-identity --profile {self.aws_profile}"
         if not run_command(cmd, verbose=False)[0]:
             print_colored("AWS CLI not properly configured.", "red")
-            print_colored("Please run 'aws configure --profile {self.aws_profile}' and try again.", "yellow")
+            print_colored(f"Please run 'aws configure --profile {self.aws_profile}' and try again.", "yellow")
             sys.exit(1)
 
         # Get basic info
