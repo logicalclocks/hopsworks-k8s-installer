@@ -56,21 +56,14 @@ HELM_BASE_CONFIG = {
 CLOUD_SPECIFIC_VALUES = {
     "AWS": {
         "global._hopsworks.cloudProvider": "AWS",
-        "global._hopsworks.ingressController.type": "none",
         "global._hopsworks.managedDockerRegistery.enabled": "true",
         "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
         "global._hopsworks.managedDockerRegistery.credHelper.secretName": "awsregcred",
         "global._hopsworks.storageClassName": "ebs-gp3",
+        "global._hopsworks.externalLoadBalancers.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-scheme": "internet-facing",
         "hopsworks.variables.docker_operations_managed_docker_secrets": "awsregcred",
         "hopsworks.variables.docker_operations_image_pull_secrets": "awsregcred",
-        "hopsworks.dockerRegistry.preset.secrets[0]": "awsregcred",
-        "externalLoadBalancers": {
-            "enabled": True,
-            "class": None,
-            "annotations": {
-                "service.beta.kubernetes.io/aws-load-balancer-scheme": "internet-facing"
-            }
-        }
+        "hopsworks.dockerRegistry.preset.secrets[0]": "awsregcred"
     },
     "GCP": {
         "global._hopsworks.cloudProvider": "GCP",
@@ -78,21 +71,18 @@ CLOUD_SPECIFIC_VALUES = {
         "global._hopsworks.managedDockerRegistery.credHelper.enabled": "true",
         "global._hopsworks.managedDockerRegistery.credHelper.configMap": "docker-config",
         "global._hopsworks.managedDockerRegistery.credHelper.secretName": "gcrregcred",
+        "global._hopsworks.serviceAccount.name": "hopsworks-sa",
         "hopsworks.variables.docker_operations_managed_docker_secrets": "gcrregcred",
         "hopsworks.variables.docker_operations_image_pull_secrets": "gcrregcred",
-        "hopsworks.dockerRegistry.preset.secrets[0]": "gcrregcred",
-        "serviceAccount.name": "hopsworks-sa"
+        "hopsworks.dockerRegistry.preset.secrets[0]": "gcrregcred"
     },
     "Azure": {
         "global._hopsworks.cloudProvider": "AZURE",
-        "global._hopsworks.managedDockerRegistery.enabled": "true",
-        "global._hopsworks.ingressController.type": "none",
-        "global._hopsworks.imagePullSecretName": "regcred",
-        "global._hopsworks.minio.enabled": "true", 
-        "serviceAccount.name": "hopsworks-sa",
-        "serviceAccount.create": "false",
-        "hopsworks.service.worker.external.https.type": "LoadBalancer",  
-        "hopsworks.service.worker.external.https.annotations.service\\.beta\\.kubernetes\\.io/azure-load-balancer-internal": "false"
+        "global._hopsworks.minio.enabled": "true",
+        "global._hopsworks.imagePullSecrets[0].name": "regcred",
+        "global._hopsworks.serviceAccount.name": "hopsworks-sa",
+        "global._hopsworks.serviceAccount.create": "false",
+        "global._hopsworks.externalLoadBalancers.annotations.service\\.beta\\.kubernetes\\.io/azure-load-balancer-internal": "false"
     },
     "OVH": {
         "global._hopsworks.cloudProvider": "OVH"
@@ -320,7 +310,7 @@ class HopsworksInstaller:
                     cloud_config.update({
                         "global._hopsworks.managedDockerRegistery.domain": self.managed_registry_info['domain'],
                         "global._hopsworks.managedDockerRegistery.namespace": self.managed_registry_info['namespace'],
-                        "serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account": self.sa_email
+                        "global._hopsworks.serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account": self.sa_email
                     })
                     
                 elif self.environment == "Azure" and hasattr(self, 'registry_secrets_created'):
