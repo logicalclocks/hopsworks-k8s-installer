@@ -73,6 +73,7 @@ CLOUD_SPECIFIC_VALUES = {
     "Azure": {
         "global._hopsworks.cloudProvider": "AZURE",
         "global._hopsworks.minio.enabled": "true",
+        "global._hopsworks.storageClassName": "managed-csi",
         "global._hopsworks.imagePullSecrets[0].name": "regcred",
         "global._hopsworks.serviceAccount.name": "hopsworks-sa",
         "global._hopsworks.serviceAccount.create": "false",
@@ -395,16 +396,20 @@ class HopsworksInstaller:
             print_colored("Installation cancelled by user.", "yellow")
             sys.exit(0)
 
-        # 4. Create S3 bucket
+        # 4. Create S3 bucket (or use existing)
         print_colored("\nCreating AWS resources...", "blue")
         cmd = f"aws s3 mb s3://{bucket_name} --region {self.region} --profile {self.aws_profile}"
-        if not run_command(cmd)[0]:
-            print_colored("Failed to create S3 bucket.", "red")
-            print_colored("Possible causes:", "yellow")
-            print("  - Bucket name already exists globally")
-            print("  - Insufficient IAM permissions")
-            print("  - Invalid bucket name format")
-            sys.exit(1)
+        success, _, stderr = run_command(cmd)
+        if not success:
+            if "BucketAlreadyOwnedByYou" in stderr or "BucketAlreadyExists" in stderr:
+                print_colored(f"S3 bucket '{bucket_name}' already exists, using existing bucket.", "yellow")
+            else:
+                print_colored("Failed to create S3 bucket.", "red")
+                print_colored("Possible causes:", "yellow")
+                print("  - Bucket name already exists globally (owned by someone else)")
+                print("  - Insufficient IAM permissions")
+                print("  - Invalid bucket name format")
+                sys.exit(1)
         
         # Enable versioning on the bucket
         cmd = f"aws s3api put-bucket-versioning --bucket {bucket_name} --versioning-configuration Status=Enabled --profile {self.aws_profile}"
@@ -412,15 +417,7 @@ class HopsworksInstaller:
             print_colored("Failed to enable bucket versioning", "red")
             sys.exit(1)
 
-        # 3. Create ECR repository
-        print_colored("\nCreating ECR repository...", "cyan")
-        repo_name = f"{self.cluster_name}/hopsworks-base"
-        cmd = f"aws ecr create-repository --repository-name {repo_name} --profile {self.aws_profile} --region {self.region}"
-        if not run_command(cmd)[0]:
-            print_colored("Failed to create ECR repository", "red")
-            sys.exit(1)
-
-        # 4. Create IAM policy
+        # 3. Create IAM policy
         print_colored("\nCreating IAM policies...", "cyan")
         policy = {
             "Version": "2012-10-17",
@@ -686,8 +683,11 @@ class HopsworksInstaller:
                     "artifactregistry.repositories.get",
                     "artifactregistry.repositories.uploadArtifacts",
                     "artifactregistry.repositories.downloadArtifacts",
+                    "artifactregistry.repositories.list",
                     "artifactregistry.tags.list",
-                    "artifactregistry.repositories.list"
+                    "artifactregistry.tags.create",
+                    "artifactregistry.tags.delete",
+                    "artifactregistry.versions.delete"
                 ]
             }
             yaml.dump(role_def, role_file)
@@ -779,6 +779,7 @@ class HopsworksInstaller:
                        f"--machine-type={machine_type} "
                        f"--num-nodes={node_count} "
                        f"--enable-ip-alias "
+                       f"--workload-pool={self.project_id}.svc.id.goog "
                        f"--service-account={self.sa_email}")
 
         if not run_command(cluster_cmd)[0]:
@@ -797,18 +798,8 @@ class HopsworksInstaller:
                     f"--zone={self.zone} "
                     f"--project={self.project_id}")
 
-        # 8. Setup Artifact Registry
-        registry_name = f"hopsworks-{self.cluster_name}-{timestamp}"
-        print_colored("Creating Artifact Registry repository...", "cyan")
-        success, _, error = run_command(f"gcloud artifacts repositories create {registry_name} "
-                    f"--repository-format=docker "
-                    f"--location={self.region} "
-                    f"--project={self.project_id}")
-        if not success and "already exists" not in error:
-            print_colored(f"Failed to create Artifact Registry: {error}", "red")
-            sys.exit(1)
-        else:
-            print_colored(f"Artifact Registry repository '{registry_name}' created or already exists.", "green")
+        # 8. Store registry name for later use in setup_gke_registry
+        self._gke_registry_name = f"hopsworks-{self.cluster_name}-{timestamp}"
 
         # Now, set up GKE authentication
         self.setup_gke_authentication()
@@ -834,11 +825,10 @@ class HopsworksInstaller:
             f"iam.gke.io/gcp-service-account={self.sa_email}"
         )
 
-        # 2. Setup Docker config for both GCP and hops.works registries
+        # 2. Setup Docker config for GCP Artifact Registry
         docker_config = {
             "credHelpers": {
-                f"{self.region}-docker.pkg.dev": "gcloud",
-                "docker.hops.works": "gcloud"
+                f"{self.region}-docker.pkg.dev": "gcloud"
             }
         }
 
@@ -916,16 +906,30 @@ class HopsworksInstaller:
             print_colored("Failed to start AKS cluster creation.", "red")
             sys.exit(1)
 
-        # Wait for cluster to be ready
+        # Wait for cluster to be ready with timeout
         print_colored("\nWaiting for cluster to be ready...", "cyan")
+        time.sleep(30)  # Initial delay after --no-wait to let Azure start provisioning
+
+        max_wait_time = 1800  # 30 minutes timeout
+        start_time = time.time()
+
         while True:
+            elapsed = time.time() - start_time
+            if elapsed > max_wait_time:
+                print_colored(f"Timeout waiting for AKS cluster after {max_wait_time // 60} minutes.", "red")
+                print_colored("Check Azure portal for cluster status.", "yellow")
+                sys.exit(1)
+
             success, output, _ = run_command(
                 f"az aks show --resource-group {self.resource_group} --name {self.cluster_name} --query provisioningState -o tsv",
                 verbose=False
             )
             if success and "Succeeded" in output:
                 break
-            print_colored("Still creating cluster...", "yellow")
+            if success and "Failed" in output:
+                print_colored("AKS cluster creation failed.", "red")
+                sys.exit(1)
+            print_colored(f"Still creating cluster... ({int(elapsed)}s elapsed)", "yellow")
             time.sleep(30)
 
         # Get credentials
@@ -1204,6 +1208,9 @@ subjects:
             if not self.setup_gke_registry():
                 print_colored("GCP Artifact Registry setup failed. Cannot proceed with installation.", "red")
                 sys.exit(1)
+        elif self.environment == "Azure":
+            print_colored("Setting up Azure registry credentials...", "blue")
+            self.handle_azure_registry()
 
     def setup_aws_ecr(self):
         client = boto3.client('ecr', region_name=self.region)
@@ -1223,14 +1230,24 @@ subjects:
     def setup_gke_registry(self):
             """Setup Artifact Registry"""
             try:
-                timestamp = int(time.time())
-                registry_name = f"hopsworks-{self.cluster_name}-{timestamp}"
-                
+                # Use registry name from setup_gke_prerequisites if available, else generate new
+                registry_name = getattr(self, '_gke_registry_name', None)
+                if not registry_name:
+                    timestamp = int(time.time())
+                    registry_name = f"hopsworks-{self.cluster_name}-{timestamp}"
+
                 # Create Artifact Registry repository
-                run_command(f"gcloud artifacts repositories create {registry_name} "
+                print_colored(f"Creating Artifact Registry repository '{registry_name}'...", "cyan")
+                success, _, error = run_command(f"gcloud artifacts repositories create {registry_name} "
                             f"--repository-format=docker "
                             f"--location={self.region} "
                             f"--project={self.project_id}")
+
+                if not success and "already exists" not in error:
+                    print_colored(f"Failed to create Artifact Registry: {error}", "red")
+                    return False
+
+                print_colored(f"Artifact Registry repository '{registry_name}' ready.", "green")
 
                 self.managed_registry_info = {
                     "domain": f"{self.region}-docker.pkg.dev",
