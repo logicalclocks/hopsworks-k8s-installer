@@ -1275,18 +1275,18 @@ subjects:
         # Show available versions if user hasn't specified one
         if not self.args.version:
             print_colored("\nFetching available Hopsworks versions...", "cyan")
-            # Always use --devel to show all versions including RCs
-            search_cmd = "helm search repo hopsworks/hopsworks -l --devel"
+            search_cmd = "helm search repo hopsworks/hopsworks -l"
 
             success, output, _ = run_command(search_cmd, verbose=False)
             if success and output.strip():
                 print_colored("\nAvailable versions:", "blue")
-                # Show only first 10 versions to avoid clutter
                 lines = output.strip().split('\n')
-                for line in lines[:11]:  # Header + 10 versions
+                # Header line + stable versions only (no RC/pre-release)
+                stable_lines = [lines[0]] + [l for l in lines[1:] if '-rc' not in l.lower()]
+                for line in stable_lines[:11]:  # Header + 10 versions
                     print(line)
-                if len(lines) > 11:
-                    print(f"... and {len(lines) - 11} more versions")
+                if len(stable_lines) > 11:
+                    print(f"... and {len(stable_lines) - 11} more versions")
 
                 print_colored("\nYou can specify a version with --version flag, or press Enter to use the latest.", "yellow")
                 use_specific = get_user_input("Do you want to specify a version now? (yes/no)", options=["yes", "no"], default="no")
