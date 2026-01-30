@@ -287,7 +287,7 @@ class HopsworksInstaller:
                 f"--namespace={self.namespace}",
                 "--create-namespace",
                 "--values hopsworks/values.yaml",
-                "--set velero.backup.enabled=false"  # Velero not needed for dev installs
+                "--set hopsworks.velero.backup.enabled=false"  # Velero not needed for dev installs
             ]
             
             # Helper function to flatten nested dictionaries
