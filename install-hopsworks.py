@@ -286,7 +286,8 @@ class HopsworksInstaller:
                 "helm upgrade --install hopsworks-release hopsworks-dev/hopsworks",
                 f"--namespace={self.namespace}",
                 "--create-namespace",
-                "--values hopsworks/values.yaml"
+                "--values hopsworks/values.yaml",
+                "--set velero.backup.enabled=false"  # Velero not needed for dev installs
             ]
             
             # Helper function to flatten nested dictionaries
