@@ -270,7 +270,7 @@ class HopsworksInstaller:
             """Constructs the helm command with proper configuration"""
             # Base helm command
             helm_command = [
-                "helm upgrade --install hopsworks-release hopsworks/hopsworks",
+                "helm upgrade --install hopsworks-release hopsworks-dev/hopsworks",
                 f"--namespace={self.namespace}",
                 "--create-namespace",
                 "--values hopsworks/values.yaml"
@@ -1264,7 +1264,7 @@ subjects:
         print_colored("\nInstalling Hopsworks...", "blue")
 
         # Setup helm repos - this part works, keep it
-        if not run_command("helm repo add hopsworks https://nexus.hops.works/repository/hopsworks-helm --force-update")[0]:
+        if not run_command("helm repo add hopsworks-dev https://nexus.hops.works/repository/hopsworks-helm-dev --force-update")[0]:
             print_colored("Failed to add Hopsworks Helm repo.", "red")
             return False
 
@@ -1275,18 +1275,16 @@ subjects:
         # Show available versions if user hasn't specified one
         if not self.args.version:
             print_colored("\nFetching available Hopsworks versions...", "cyan")
-            search_cmd = "helm search repo hopsworks/hopsworks -l"
+            search_cmd = "helm search repo hopsworks-dev/hopsworks -l --devel"
 
             success, output, _ = run_command(search_cmd, verbose=False)
             if success and output.strip():
-                print_colored("\nAvailable versions:", "blue")
+                print_colored("\nAvailable dev versions:", "blue")
                 lines = output.strip().split('\n')
-                # Header line + stable versions only (no RC/pre-release)
-                stable_lines = [lines[0]] + [l for l in lines[1:] if '-rc' not in l.lower()]
-                for line in stable_lines[:11]:  # Header + 10 versions
+                for line in lines[:11]:  # Header + 10 versions
                     print(line)
-                if len(stable_lines) > 11:
-                    print(f"... and {len(stable_lines) - 11} more versions")
+                if len(lines) > 11:
+                    print(f"... and {len(lines) - 11} more versions")
 
                 print_colored("\nYou can specify a version with --version flag, or press Enter to use the latest.", "yellow")
                 use_specific = get_user_input("Do you want to specify a version now? (yes/no)", options=["yes", "no"], default="no")
@@ -1303,11 +1301,9 @@ subjects:
             shutil.rmtree('hopsworks', ignore_errors=True)
 
         # Build helm pull command
-        pull_cmd = "helm pull hopsworks/hopsworks --untar"
+        pull_cmd = "helm pull hopsworks-dev/hopsworks --untar --devel"
         if self.args.version:
             pull_cmd += f" --version {self.args.version}"
-        if self.args.devel:
-            pull_cmd += " --devel"
 
         if not run_command(pull_cmd)[0]:
             print_colored("Failed to pull Hopsworks chart.", "red")
