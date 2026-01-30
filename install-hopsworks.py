@@ -1263,9 +1263,17 @@ subjects:
         """Installs Hopsworks consistently across all cloud providers"""
         print_colored("\nInstalling Hopsworks...", "blue")
 
-        # Setup helm repos - this part works, keep it
-        if not run_command("helm repo add hopsworks-dev https://nexus.hops.works/repository/hopsworks-helm-dev --force-update")[0]:
-            print_colored("Failed to add Hopsworks Helm repo.", "red")
+        # Setup helm repos - dev repo requires authentication
+        nexus_user = os.environ.get("NEXUS_USER")
+        nexus_pass = os.environ.get("NEXUS_PASSWORD")
+        if not nexus_user or not nexus_pass:
+            print_colored("NEXUS_USER and NEXUS_PASSWORD environment variables required for dev repo.", "red")
+            print_colored("Export them before running: export NEXUS_USER=xxx NEXUS_PASSWORD=xxx", "yellow")
+            return False
+
+        repo_cmd = f'helm repo add hopsworks-dev https://nexus.hops.works/repository/hopsworks-helm-dev --username {nexus_user} --password "{nexus_pass}" --force-update'
+        if not run_command(repo_cmd)[0]:
+            print_colored("Failed to add Hopsworks dev Helm repo.", "red")
             return False
 
         if not run_command("helm repo update")[0]:
