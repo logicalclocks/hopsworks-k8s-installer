@@ -352,9 +352,8 @@ class HopsworksInstaller:
             if self.args.version:
                 helm_command.append(f"--version {self.args.version}")
 
-            # Add devel flag if requested
-            if self.args.devel:
-                helm_command.append("--devel")
+            # Always add devel flag for dev repo (alpha/rc versions)
+            helm_command.append("--devel")
 
             return " ".join(helm_command)
     def setup_aws_prerequisites(self):
