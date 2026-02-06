@@ -57,7 +57,9 @@ HELM_BASE_CONFIG = {
     "global._hopsworks.imagePullPolicy": "Always",
     "hopsworks.replicaCount.worker": "1",
     "rondb.rondb.clusterSize.activeDataReplicas": "1",
-    "hopsfs.datanode.count": "2"
+    "hopsfs.datanode.count": "2",
+    "hopsworks.variables.admin_email": "notadmin@hopsworks.ai",
+    "hopsworks.variables.admin_password": "d$imL5ziY8Nh"
 }
 
 CLOUD_SPECIFIC_VALUES = {
@@ -1427,7 +1429,7 @@ subjects:
         print_colored("\nHopsworks is accessible at:", "green")
         print_colored(f"UI:    https://{address}:28181", "cyan")
         print_colored(f"API:   https://{address}:8182", "cyan")
-        print_colored("Login: admin@hopsworks.ai / admin", "cyan")
+        print_colored("Login: notadmin@hopsworks.ai / d$imL5ziY8Nh", "cyan")
 
         if health_check(self.namespace):
             print_colored("\nHealth check passed!", "green")
@@ -1453,111 +1455,77 @@ def periodic_status_update(stop_event, namespace):
 
 def wait_for_deployment(namespace, timeout=2700):
     """
-    Enhanced deployment monitor that exits immediately when ready,
-    or lets you override with a keypress.
+    Wait for core Hopsworks deployments and preset-images job.
+    Deployments: hopsworks-admin, hopsworks-instance (worker)
+    Job: preset-images-* (baked Python env docker images — nothing runs without these)
     """
-    print_colored("\nMonitoring core services...", "blue")
+    print_colored("\nWaiting for core services to be ready...", "blue")
+
+    core_deployments = ["hopsworks-admin", "hopsworks-instance"]
+    ready = {}
     start_time = time.time()
-    
-    import threading
-    import sys
-    if sys.platform != 'win32':
-        import termios
-        import tty
 
-    override_flag = threading.Event()
-    
-    def check_status():
-        """Check if deployment is ready"""
-        # Check jobs
-        cmd = f"kubectl get jobs -n {namespace} -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[*].type"
+    def check_preset_job():
+        """Check if any preset-images job has completed"""
+        cmd = f"kubectl get jobs -n {namespace} -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[*].type --no-headers"
         success, output, _ = run_command(cmd, verbose=False)
-        
         if not success or not output.strip():
-            return False, 0, 0
-            
-        jobs = [line.split() for line in output.strip().split('\n')[1:]]
-        incomplete_jobs = [job[0] for job in jobs if "Complete" not in job[-1] and "SuccessCriteriaMet" not in job[-1]]
-        
-        # Check core service(s)
-        services_ready = True
-        for svc in ["hopsworks-instance"]:
-            cmd = f"kubectl get pods -n {namespace} -l app={svc} -o jsonpath='{{.items[0].status.phase}}'"
-            success, status, _ = run_command(cmd, verbose=False)
-            if not success or status.strip() != "Running":
-                services_ready = False
-                break
-                
-        total_jobs = len(jobs)
-        complete_jobs = total_jobs - len(incomplete_jobs)
-        
-        return services_ready and not incomplete_jobs, complete_jobs, total_jobs
+            return None  # Can't determine yet
+        for line in output.strip().split('\n'):
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].startswith("preset-images"):
+                return "Complete" in parts[1] or "SuccessCriteriaMet" in parts[1]
+        return None  # Job not found yet
 
-    def key_listener():
-        """Listen for keypress to override"""
-        if sys.platform == 'win32':
-            import msvcrt
-            while not override_flag.is_set():
-                if msvcrt.kbhit():
-                    key = msvcrt.getch()
-                    if key == b'1':
-                        override_flag.set()
-                threading.Event().wait(0.1)
-        else:
-            old_settings = termios.tcgetattr(sys.stdin)
-            try:
-                tty.setcbreak(sys.stdin.fileno())
-                while not override_flag.is_set():
-                    if sys.stdin.read(1) == '1':
-                        override_flag.set()
-            finally:
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-
-    # Start key listener in background
-    listener = threading.Thread(target=key_listener, daemon=True)
-    listener.start()
-    
-    print_colored("Press '1' at any time to proceed anyway", "yellow")
-    
     try:
-        while True:
-            # Check for override
-            if override_flag.is_set():
-                print("\n")
-                print_colored("Override accepted - proceeding anyway!", "yellow")
-                return True
-                
-            # Check if we've timed out
-            if (time.time() - start_time) >= timeout:
-                print_colored(f"\nTimeout after {timeout/60:.1f} minutes.", "yellow")
-                print_colored("Press '1' to proceed anyway, or Ctrl+C to abort", "cyan")
-                # Wait for override or interrupt
-                while not override_flag.is_set():
-                    time.sleep(1)
-                print_colored("\nProceeding despite timeout!", "yellow")
-                return True
-                
-            # Regular status check
-            is_ready, complete_jobs, total_jobs = check_status()
-            
-            if is_ready:
-                print("\n")
-                print_colored("All jobs complete and core services are ready!", "green")
-                return True
-            
-            # Status update
+        while (time.time() - start_time) < timeout:
+            status_parts = []
+
+            # Check deployments
+            for dep in core_deployments:
+                if ready.get(dep):
+                    status_parts.append(f"{dep}: ready")
+                    continue
+                cmd = f"kubectl rollout status deployment/{dep} -n {namespace} --timeout=5s"
+                success, _, _ = run_command(cmd, verbose=False)
+                if success:
+                    ready[dep] = True
+                    status_parts.append(f"{dep}: ready")
+                else:
+                    status_parts.append(f"{dep}: waiting")
+
+            # Check preset-images job
+            if ready.get("preset-images"):
+                status_parts.append("preset-images: done")
+            else:
+                preset_status = check_preset_job()
+                if preset_status is True:
+                    ready["preset-images"] = True
+                    status_parts.append("preset-images: done")
+                elif preset_status is False:
+                    status_parts.append("preset-images: running")
+                else:
+                    status_parts.append("preset-images: pending")
+
             elapsed = int(time.time() - start_time)
-            progress = (complete_jobs / total_jobs * 100) if total_jobs > 0 else 0
-            print_colored(f"\rProgress: {progress:.1f}% ({complete_jobs}/{total_jobs} jobs) | {elapsed}s elapsed | Press '1' to proceed", "cyan", end='')
-            
-            time.sleep(5)
-            
+            print_colored(f"\r{' | '.join(status_parts)} | {elapsed}s elapsed", "cyan", end='')
+
+            if all(ready.get(k) for k in core_deployments + ["preset-images"]):
+                print()
+                print_colored("Core deployments and preset images are ready!", "green")
+                return True
+
+            time.sleep(10)
+
+        print()
+        print_colored(f"Timeout after {timeout//60}min. Some services not ready yet.", "yellow")
+        print_colored("Check status: kubectl get pods,jobs -n hopsworks", "yellow")
+        return True  # Don't block the installer, just warn
+
     except KeyboardInterrupt:
-        print("\n")
-        print_colored("Installation interrupted. Check status manually with 'kubectl get pods,jobs -n hopsworks'", "yellow")
+        print()
+        print_colored("Interrupted. Check status: kubectl get pods,jobs -n hopsworks", "yellow")
         return False
-    finally:
-        override_flag.set()  # Stop the key listener
 
 def health_check(namespace):
     print_colored("\nPerforming basic health check...", "blue")
