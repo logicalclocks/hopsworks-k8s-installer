@@ -12,6 +12,7 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.
 # If not, see <https://www.gnu.org/licenses/>.
  
+import shlex
 import subprocess
 import time
 import sys
@@ -343,8 +344,8 @@ class HopsworksInstaller:
                 elif isinstance(value, (int, float)):
                     value = str(value)
                 else:
-                    # Escape special characters in string values
-                    value = f'"{str(value)}"'
+                    # Shell-safe quoting to handle $, spaces, etc.
+                    value = shlex.quote(str(value))
                 
                 helm_command.append(f"--set {key}={value}")
 
