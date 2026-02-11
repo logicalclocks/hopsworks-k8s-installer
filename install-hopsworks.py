@@ -12,6 +12,7 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.
 # If not, see <https://www.gnu.org/licenses/>.
  
+import shlex
 import subprocess
 import time
 import sys
@@ -23,6 +24,20 @@ import boto3
 import json
 import tempfile
 import yaml
+import getpass
+
+# Load .env file if present
+def load_dotenv():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ.setdefault(key.strip(), value.strip())
+
+load_dotenv()
 
 HOPSWORKS_LOGO = """
 ██╗  ██╗    ██████╗    ██████╗    ███████╗   ██╗    ██╗    ██████╗    ██████╗    ██╗  ██╗   ███████╗
@@ -44,7 +59,9 @@ HELM_BASE_CONFIG = {
     "global._hopsworks.imagePullPolicy": "Always",
     "hopsworks.replicaCount.worker": "1",
     "rondb.rondb.clusterSize.activeDataReplicas": "1",
-    "hopsfs.datanode.count": "2"
+    "hopsfs.datanode.count": "2",
+    "hopsworks.variables.admin_email": "notadmin@hopsworks.ai",
+    "hopsworks.variables.admin_password": "d$imL5ziY8Nh"
 }
 
 CLOUD_SPECIFIC_VALUES = {
@@ -218,6 +235,10 @@ class HopsworksInstaller:
             self.resource_group = None
             self.registry_secrets_created = False
 
+            # Helm repo
+            self.use_dev_repo = False
+            self.helm_repo_name = "hopsworks"
+
             # Temp file tracking
             self.temp_files = []
 
@@ -270,10 +291,12 @@ class HopsworksInstaller:
             """Constructs the helm command with proper configuration"""
             # Base helm command
             helm_command = [
-                "helm upgrade --install hopsworks-release hopsworks/hopsworks",
+                f"helm upgrade --install hopsworks-release {self.helm_repo_name}/hopsworks"
+                + (" --pass-credentials" if self.use_dev_repo else ""),
                 f"--namespace={self.namespace}",
                 "--create-namespace",
-                "--values hopsworks/values.yaml"
+                "--values hopsworks/values.yaml",
+                "--set hopsworks.velero.backup.enabled=false"  # Velero not needed for dev installs
             ]
             
             # Helper function to flatten nested dictionaries
@@ -327,8 +350,8 @@ class HopsworksInstaller:
                 elif isinstance(value, (int, float)):
                     value = str(value)
                 else:
-                    # Escape special characters in string values
-                    value = f'"{str(value)}"'
+                    # Shell-safe quoting to handle $, spaces, etc.
+                    value = shlex.quote(str(value))
                 
                 helm_command.append(f"--set {key}={value}")
 
@@ -339,9 +362,8 @@ class HopsworksInstaller:
             if self.args.version:
                 helm_command.append(f"--version {self.args.version}")
 
-            # Add devel flag if requested
-            if self.args.devel:
-                helm_command.append("--devel")
+            # Always add devel flag for dev repo (alpha/rc versions)
+            helm_command.append("--devel")
 
             return " ".join(helm_command)
     def setup_aws_prerequisites(self):
@@ -1263,25 +1285,53 @@ subjects:
         """Installs Hopsworks consistently across all cloud providers"""
         print_colored("\nInstalling Hopsworks...", "blue")
 
-        # Setup helm repos - this part works, keep it
-        if not run_command("helm repo add hopsworks https://nexus.hops.works/repository/hopsworks-helm --force-update")[0]:
-            print_colored("Failed to add Hopsworks Helm repo.", "red")
-            return False
+        # Ask for dev or stable repo
+        repo_choice = get_user_input(
+            "Which Helm repository do you want to use?\n1. Stable (public releases)\n2. Dev (pre-release, requires credentials)\nEnter your choice",
+            options=["1", "2"], default="1"
+        )
+        self.use_dev_repo = repo_choice == "2"
+
+        # Setup helm repo
+        if self.use_dev_repo:
+            self.helm_repo_name = "hopsworks-dev"
+            nexus_user = os.environ.get("NEXUS_USER")
+            nexus_pass = os.environ.get("NEXUS_PASSWORD")
+            if not nexus_user:
+                nexus_user = get_user_input("Nexus username", validator=validate_non_empty)
+            if not nexus_pass:
+                nexus_pass = getpass.getpass("Nexus password: ")
+            if not nexus_user or not nexus_pass:
+                print_colored("Username and password are required for the dev repo.", "red")
+                return False
+
+            repo_cmd = f'helm repo add hopsworks-dev https://nexus.hops.works/repository/hopsworks-helm-dev --username {nexus_user} --password "{nexus_pass}" --force-update'
+            if not run_command(repo_cmd)[0]:
+                print_colored("Failed to add Hopsworks dev Helm repo.", "red")
+                return False
+        else:
+            self.helm_repo_name = "hopsworks"
+            repo_cmd = 'helm repo add hopsworks https://nexus.hops.works/repository/hopsworks-helm --force-update'
+            if not run_command(repo_cmd)[0]:
+                print_colored("Failed to add Hopsworks Helm repo.", "red")
+                return False
 
         if not run_command("helm repo update")[0]:
             print_colored("Failed to update Helm repos.", "red")
             return False
 
         # Show available versions if user hasn't specified one
+        chart_ref = f"{self.helm_repo_name}/hopsworks"
         if not self.args.version:
             print_colored("\nFetching available Hopsworks versions...", "cyan")
-            # Always use --devel to show all versions including RCs
-            search_cmd = "helm search repo hopsworks/hopsworks -l --devel"
+            search_cmd = f"helm search repo {chart_ref} -l"
+            if self.use_dev_repo:
+                search_cmd += " --devel"
 
             success, output, _ = run_command(search_cmd, verbose=False)
             if success and output.strip():
-                print_colored("\nAvailable versions:", "blue")
-                # Show only first 10 versions to avoid clutter
+                label = "dev" if self.use_dev_repo else "stable"
+                print_colored(f"\nAvailable {label} versions:", "blue")
                 lines = output.strip().split('\n')
                 for line in lines[:11]:  # Header + 10 versions
                     print(line)
@@ -1303,11 +1353,11 @@ subjects:
             shutil.rmtree('hopsworks', ignore_errors=True)
 
         # Build helm pull command
-        pull_cmd = "helm pull hopsworks/hopsworks --untar"
+        pull_cmd = f"helm pull {chart_ref} --untar"
+        if self.use_dev_repo:
+            pull_cmd += " --devel --pass-credentials"
         if self.args.version:
             pull_cmd += f" --version {self.args.version}"
-        if self.args.devel:
-            pull_cmd += " --devel"
 
         if not run_command(pull_cmd)[0]:
             print_colored("Failed to pull Hopsworks chart.", "red")
@@ -1410,7 +1460,7 @@ subjects:
         print_colored("\nHopsworks is accessible at:", "green")
         print_colored(f"UI:    https://{address}:28181", "cyan")
         print_colored(f"API:   https://{address}:8182", "cyan")
-        print_colored("Login: admin@hopsworks.ai / admin", "cyan")
+        print_colored("Login: notadmin@hopsworks.ai / d$imL5ziY8Nh", "cyan")
 
         if health_check(self.namespace):
             print_colored("\nHealth check passed!", "green")
@@ -1436,111 +1486,77 @@ def periodic_status_update(stop_event, namespace):
 
 def wait_for_deployment(namespace, timeout=2700):
     """
-    Enhanced deployment monitor that exits immediately when ready,
-    or lets you override with a keypress.
+    Wait for core Hopsworks deployments and preset-images job.
+    Deployments: hopsworks-admin, hopsworks-instance (worker)
+    Job: preset-images-* (baked Python env docker images — nothing runs without these)
     """
-    print_colored("\nMonitoring core services...", "blue")
+    print_colored("\nWaiting for core services to be ready...", "blue")
+
+    core_deployments = ["hopsworks-admin", "hopsworks-instance"]
+    ready = {}
     start_time = time.time()
-    
-    import threading
-    import sys
-    if sys.platform != 'win32':
-        import termios
-        import tty
 
-    override_flag = threading.Event()
-    
-    def check_status():
-        """Check if deployment is ready"""
-        # Check jobs
-        cmd = f"kubectl get jobs -n {namespace} -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[*].type"
+    def check_preset_job():
+        """Check if any preset-images job has completed"""
+        cmd = f"kubectl get jobs -n {namespace} -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[*].type --no-headers"
         success, output, _ = run_command(cmd, verbose=False)
-        
         if not success or not output.strip():
-            return False, 0, 0
-            
-        jobs = [line.split() for line in output.strip().split('\n')[1:]]
-        incomplete_jobs = [job[0] for job in jobs if "Complete" not in job[-1] and "SuccessCriteriaMet" not in job[-1]]
-        
-        # Check core service(s)
-        services_ready = True
-        for svc in ["hopsworks-instance"]:
-            cmd = f"kubectl get pods -n {namespace} -l app={svc} -o jsonpath='{{.items[0].status.phase}}'"
-            success, status, _ = run_command(cmd, verbose=False)
-            if not success or status.strip() != "Running":
-                services_ready = False
-                break
-                
-        total_jobs = len(jobs)
-        complete_jobs = total_jobs - len(incomplete_jobs)
-        
-        return services_ready and not incomplete_jobs, complete_jobs, total_jobs
+            return None  # Can't determine yet
+        for line in output.strip().split('\n'):
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].startswith("preset-images"):
+                return "Complete" in parts[1] or "SuccessCriteriaMet" in parts[1]
+        return None  # Job not found yet
 
-    def key_listener():
-        """Listen for keypress to override"""
-        if sys.platform == 'win32':
-            import msvcrt
-            while not override_flag.is_set():
-                if msvcrt.kbhit():
-                    key = msvcrt.getch()
-                    if key == b'1':
-                        override_flag.set()
-                threading.Event().wait(0.1)
-        else:
-            old_settings = termios.tcgetattr(sys.stdin)
-            try:
-                tty.setcbreak(sys.stdin.fileno())
-                while not override_flag.is_set():
-                    if sys.stdin.read(1) == '1':
-                        override_flag.set()
-            finally:
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-
-    # Start key listener in background
-    listener = threading.Thread(target=key_listener, daemon=True)
-    listener.start()
-    
-    print_colored("Press '1' at any time to proceed anyway", "yellow")
-    
     try:
-        while True:
-            # Check for override
-            if override_flag.is_set():
-                print("\n")
-                print_colored("Override accepted - proceeding anyway!", "yellow")
-                return True
-                
-            # Check if we've timed out
-            if (time.time() - start_time) >= timeout:
-                print_colored(f"\nTimeout after {timeout/60:.1f} minutes.", "yellow")
-                print_colored("Press '1' to proceed anyway, or Ctrl+C to abort", "cyan")
-                # Wait for override or interrupt
-                while not override_flag.is_set():
-                    time.sleep(1)
-                print_colored("\nProceeding despite timeout!", "yellow")
-                return True
-                
-            # Regular status check
-            is_ready, complete_jobs, total_jobs = check_status()
-            
-            if is_ready:
-                print("\n")
-                print_colored("All jobs complete and core services are ready!", "green")
-                return True
-            
-            # Status update
+        while (time.time() - start_time) < timeout:
+            status_parts = []
+
+            # Check deployments
+            for dep in core_deployments:
+                if ready.get(dep):
+                    status_parts.append(f"{dep}: ready")
+                    continue
+                cmd = f"kubectl rollout status deployment/{dep} -n {namespace} --timeout=5s"
+                success, _, _ = run_command(cmd, verbose=False)
+                if success:
+                    ready[dep] = True
+                    status_parts.append(f"{dep}: ready")
+                else:
+                    status_parts.append(f"{dep}: waiting")
+
+            # Check preset-images job
+            if ready.get("preset-images"):
+                status_parts.append("preset-images: done")
+            else:
+                preset_status = check_preset_job()
+                if preset_status is True:
+                    ready["preset-images"] = True
+                    status_parts.append("preset-images: done")
+                elif preset_status is False:
+                    status_parts.append("preset-images: running")
+                else:
+                    status_parts.append("preset-images: pending")
+
             elapsed = int(time.time() - start_time)
-            progress = (complete_jobs / total_jobs * 100) if total_jobs > 0 else 0
-            print_colored(f"\rProgress: {progress:.1f}% ({complete_jobs}/{total_jobs} jobs) | {elapsed}s elapsed | Press '1' to proceed", "cyan", end='')
-            
-            time.sleep(5)
-            
+            print_colored(f"\r{' | '.join(status_parts)} | {elapsed}s elapsed", "cyan", end='')
+
+            if all(ready.get(k) for k in core_deployments + ["preset-images"]):
+                print()
+                print_colored("Core deployments and preset images are ready!", "green")
+                return True
+
+            time.sleep(10)
+
+        print()
+        print_colored(f"Timeout after {timeout//60}min. Some services not ready yet.", "yellow")
+        print_colored("Check status: kubectl get pods,jobs -n hopsworks", "yellow")
+        return True  # Don't block the installer, just warn
+
     except KeyboardInterrupt:
-        print("\n")
-        print_colored("Installation interrupted. Check status manually with 'kubectl get pods,jobs -n hopsworks'", "yellow")
+        print()
+        print_colored("Interrupted. Check status: kubectl get pods,jobs -n hopsworks", "yellow")
         return False
-    finally:
-        override_flag.set()  # Stop the key listener
 
 def health_check(namespace):
     print_colored("\nPerforming basic health check...", "blue")
