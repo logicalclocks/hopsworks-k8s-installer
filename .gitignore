@@ -10,3 +10,4 @@ iam_policy_alb.json
 storage-class-*.yaml
 sa.yaml
 modal-hopsworks.py.env
+.env

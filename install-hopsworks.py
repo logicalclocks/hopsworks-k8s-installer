@@ -24,6 +24,7 @@ import boto3
 import json
 import tempfile
 import yaml
+import getpass
 
 # Load .env file if present
 def load_dotenv():
@@ -234,6 +235,10 @@ class HopsworksInstaller:
             self.resource_group = None
             self.registry_secrets_created = False
 
+            # Helm repo
+            self.use_dev_repo = False
+            self.helm_repo_name = "hopsworks"
+
             # Temp file tracking
             self.temp_files = []
 
@@ -286,7 +291,8 @@ class HopsworksInstaller:
             """Constructs the helm command with proper configuration"""
             # Base helm command
             helm_command = [
-                "helm upgrade --install hopsworks-release hopsworks-dev/hopsworks",
+                f"helm upgrade --install hopsworks-release {self.helm_repo_name}/hopsworks"
+                + (" --pass-credentials" if self.use_dev_repo else ""),
                 f"--namespace={self.namespace}",
                 "--create-namespace",
                 "--values hopsworks/values.yaml",
@@ -1279,31 +1285,53 @@ subjects:
         """Installs Hopsworks consistently across all cloud providers"""
         print_colored("\nInstalling Hopsworks...", "blue")
 
-        # Setup helm repos - dev repo requires authentication
-        nexus_user = os.environ.get("NEXUS_USER")
-        nexus_pass = os.environ.get("NEXUS_PASSWORD")
-        if not nexus_user or not nexus_pass:
-            print_colored("NEXUS_USER and NEXUS_PASSWORD environment variables required for dev repo.", "red")
-            print_colored("Export them before running: export NEXUS_USER=xxx NEXUS_PASSWORD=xxx", "yellow")
-            return False
+        # Ask for dev or stable repo
+        repo_choice = get_user_input(
+            "Which Helm repository do you want to use?\n1. Stable (public releases)\n2. Dev (pre-release, requires credentials)\nEnter your choice",
+            options=["1", "2"], default="1"
+        )
+        self.use_dev_repo = repo_choice == "2"
 
-        repo_cmd = f'helm repo add hopsworks-dev https://nexus.hops.works/repository/hopsworks-helm-dev --username {nexus_user} --password "{nexus_pass}" --force-update'
-        if not run_command(repo_cmd)[0]:
-            print_colored("Failed to add Hopsworks dev Helm repo.", "red")
-            return False
+        # Setup helm repo
+        if self.use_dev_repo:
+            self.helm_repo_name = "hopsworks-dev"
+            nexus_user = os.environ.get("NEXUS_USER")
+            nexus_pass = os.environ.get("NEXUS_PASSWORD")
+            if not nexus_user:
+                nexus_user = get_user_input("Nexus username", validator=validate_non_empty)
+            if not nexus_pass:
+                nexus_pass = getpass.getpass("Nexus password: ")
+            if not nexus_user or not nexus_pass:
+                print_colored("Username and password are required for the dev repo.", "red")
+                return False
+
+            repo_cmd = f'helm repo add hopsworks-dev https://nexus.hops.works/repository/hopsworks-helm-dev --username {nexus_user} --password "{nexus_pass}" --force-update'
+            if not run_command(repo_cmd)[0]:
+                print_colored("Failed to add Hopsworks dev Helm repo.", "red")
+                return False
+        else:
+            self.helm_repo_name = "hopsworks"
+            repo_cmd = 'helm repo add hopsworks https://nexus.hops.works/repository/hopsworks-helm --force-update'
+            if not run_command(repo_cmd)[0]:
+                print_colored("Failed to add Hopsworks Helm repo.", "red")
+                return False
 
         if not run_command("helm repo update")[0]:
             print_colored("Failed to update Helm repos.", "red")
             return False
 
         # Show available versions if user hasn't specified one
+        chart_ref = f"{self.helm_repo_name}/hopsworks"
         if not self.args.version:
             print_colored("\nFetching available Hopsworks versions...", "cyan")
-            search_cmd = "helm search repo hopsworks-dev/hopsworks -l --devel"
+            search_cmd = f"helm search repo {chart_ref} -l"
+            if self.use_dev_repo:
+                search_cmd += " --devel"
 
             success, output, _ = run_command(search_cmd, verbose=False)
             if success and output.strip():
-                print_colored("\nAvailable dev versions:", "blue")
+                label = "dev" if self.use_dev_repo else "stable"
+                print_colored(f"\nAvailable {label} versions:", "blue")
                 lines = output.strip().split('\n')
                 for line in lines[:11]:  # Header + 10 versions
                     print(line)
@@ -1325,7 +1353,9 @@ subjects:
             shutil.rmtree('hopsworks', ignore_errors=True)
 
         # Build helm pull command
-        pull_cmd = "helm pull hopsworks-dev/hopsworks --untar --devel"
+        pull_cmd = f"helm pull {chart_ref} --untar"
+        if self.use_dev_repo:
+            pull_cmd += " --devel --pass-credentials"
         if self.args.version:
             pull_cmd += f" --version {self.args.version}"
 
